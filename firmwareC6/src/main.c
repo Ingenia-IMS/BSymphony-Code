@@ -3,16 +3,32 @@
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
-#define AMP_STANDBY_GPIO GPIO_NUM_20   // D9 -> !standby
-#define AUDIO_GPIO       GPIO_NUM_21   // D3 -> audio out
-
-#define TONE_FREQ_HZ     2000          // pitido de 2 kHz
-#define DUTY_RES         LEDC_TIMER_10_BIT
-#define DUTY_50_PERCENT  ((1 << 10) / 2)   // 512 con 10 bits
+#include "i2s_core.h"
+#include "audio_core.h"
+#include "audio_generators.h"
+#include "sounds_h/Tormenta.h"
 
 void app_main(void)
 {
+    i2s_setup();
+
+    static array_gen_state_t sound_state = {
+        .data = audio_Tormenta,
+        .total = audio_Tormenta_len,
+        .offset = 0,
+        .loop = true
+    };
+
+    static audio_generator_t sound_gen = {
+        .state = &sound_state,
+        .generate = wavetable_generate
+    };
+
+    set_audio_generator(&sound_gen);
+    start_audio_engine(get_i2s_tx_handle());
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));

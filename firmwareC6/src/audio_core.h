@@ -5,8 +5,7 @@
 #define BUFFER_SAMPLES  256
 #define BUFFER_COUNT    2   // ping-pong
 
-#define start_audio() start_audio_engine(get_i2s_tx_handle)
-
+#define start_audio() start_audio_engine(get_i2s_tx_handle())
 void start_audio_engine(i2s_chan_handle_t i2s_tx_handle);
 
 // Tipo genérico de generador
