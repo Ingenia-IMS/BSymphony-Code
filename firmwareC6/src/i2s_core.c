@@ -17,7 +17,7 @@ void i2s_setup(void) {
     // 0. Configurar pines GPIO para el altavoz y habilitar amplifricador
     gpio_set_direction(SPK_OUT_PIN, GPIO_MODE_OUTPUT);
     gpio_set_direction(SPK_ENA_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(SPK_ENA_PIN, 1);  // 1 = alto, 0 = bajo
+    gpio_set_level(SPK_ENA_PIN, 0);  // 1 = alto, 0 = bajo
 
     i2s_chan_config_t chan_cfg = {
         .id            = I2S_NUM_0,
