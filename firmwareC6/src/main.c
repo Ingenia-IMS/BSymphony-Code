@@ -1,42 +1,76 @@
-#include <stdint.h>
-
+#include "imu/imu_manager.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_log.h"
 
-#include "sound_player.h"
-#include "leds/led_manager.h"
+static const char *TAG = "APP_MAIN";
+
+static void accion_reproducir_sonido_golpe(void)
+{
+    ESP_LOGI(TAG, "Evento detectado: GOLPE -> reproducir sonido");
+}
+
+static void accion_color_siguiente(void)
+{
+    ESP_LOGI(TAG, "Evento detectado: SHAKE -> cambiar al siguiente color");
+}
+
+static void accion_color_fijo_encendido(void)
+{
+    ESP_LOGI(TAG, "Evento detectado: PICKUP o LED ON -> color fijo encendido");
+}
+
+static void accion_led_apagado(void)
+{
+    ESP_LOGI(TAG, "LED apagado");
+}
 
 void app_main(void)
 {
-    sound_player_init();
-    led_manager_init();
+    int blink_activo = 1;
+    int blink_estado = 1;
+    int blink_contador = 0;
 
-    uint32_t step = 0;
+    imu_init();
+    ESP_LOGI(TAG, "Sistema iniciado");
 
     while (1) {
+        imu_update();
 
-        sound_player_play("Tormenta");
-
-        switch (step % 5) {
-            case 0:
-                led_manager_set_color(LED_COLOR_RED);
-                break;
-            case 1:
-                led_manager_set_color(LED_COLOR_BLUE);
-                break;
-            case 2:
-                led_manager_set_color(LED_COLOR_GREEN);
-                break;
-            case 3:
-                led_manager_set_blink(LED_COLOR_LIGHT_BLUE, 500);
-                break;
-            case 4:
-                led_manager_set_alternate(LED_COLOR_PURPLE, LED_COLOR_PINK, 400);
-                break;
+        if (imu_take_hit_event()) {
+            accion_reproducir_sonido_golpe();
         }
 
-        step++;
+        if (imu_take_shake_event()) {
+            accion_color_siguiente();
+        }
 
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        if (imu_take_pickup_event()) {
+            blink_activo = 0;
+            accion_color_fijo_encendido();
+            ESP_LOGI(TAG, "Evento detectado: PICKUP -> desactivar parpadeo");
+        }
+
+        if (imu_take_putdown_event()) {
+            blink_activo = 1;
+            blink_estado = 1;
+            ESP_LOGI(TAG, "Evento detectado: PUTDOWN -> activar parpadeo");
+        }
+
+        if (blink_activo) {
+            blink_contador++;
+            if (blink_contador >= 25) {
+                blink_contador = 0;
+                blink_estado = !blink_estado;
+
+                if (blink_estado) {
+                    accion_color_fijo_encendido();
+                } else {
+                    accion_led_apagado();
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
