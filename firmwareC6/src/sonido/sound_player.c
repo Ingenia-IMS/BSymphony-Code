@@ -3,33 +3,20 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 #include "driver/gpio.h"
 
 #include "audio_core.h"
 #include "i2s_core.h"
-
-// Sonidos disponibles
-#include "sounds_h/Tormenta.h"
-// #include "sounds_h/Viento.h"
-
-typedef struct {
-    const char *name;
-    const int16_t *data;
-    size_t len;
-} sound_def_t;
-
-static const sound_def_t sound_table[] = {
-    { "Tormenta", audio_Tormenta, audio_Tormenta_len },
-    // { "Viento",   audio_Viento,   audio_Viento_len   },
-};
-
-static const size_t sound_table_count = sizeof(sound_table) / sizeof(sound_table[0]);
+#include "sound_catalog.h"
 
 typedef struct {
     const int16_t *data;
     size_t total;
-    size_t offset;
+    uint32_t source_sample_rate;
+    uint32_t position_q16;
+    uint32_t step_q16;
     bool loop;
     bool playing;
 } sound_player_state_t;
@@ -37,7 +24,9 @@ typedef struct {
 static sound_player_state_t sound_state = {
     .data = NULL,
     .total = 0,
-    .offset = 0,
+    .source_sample_rate = 0,
+    .position_q16 = 0,
+    .step_q16 = 0,
     .loop = false,
     .playing = false
 };
@@ -51,11 +40,28 @@ static void sound_player_stop_internal(void)
 {
     sound_state.data = NULL;
     sound_state.total = 0;
-    sound_state.offset = 0;
+    sound_state.source_sample_rate = 0;
+    sound_state.position_q16 = 0;
+    sound_state.step_q16 = 0;
     sound_state.loop = false;
     sound_state.playing = false;
 
     amp_enable(false);
+}
+
+static uint32_t compute_step_q16(uint32_t source_sample_rate)
+{
+    if (source_sample_rate == 0) {
+        return 0;
+    }
+
+    uint64_t step = ((uint64_t)source_sample_rate << 16) / (uint64_t)SAMPLE_RATE;
+
+    if (step == 0) {
+        step = 1;
+    }
+
+    return (uint32_t)step;
 }
 
 static void sound_player_generate(void *state, int16_t *buf, size_t n)
@@ -63,29 +69,39 @@ static void sound_player_generate(void *state, int16_t *buf, size_t n)
     sound_player_state_t *s = (sound_player_state_t *)state;
 
     for (size_t i = 0; i < n; i++) {
-        if (s->data == NULL || s->total == 0 || !s->playing) {
+        if (s->data == NULL || s->total == 0 || !s->playing || s->step_q16 == 0) {
             buf[i] = 0;
             continue;
         }
 
-        if (s->offset >= s->total) {
+        size_t idx = (size_t)(s->position_q16 >> 16);
+        uint32_t frac = s->position_q16 & 0xFFFF;
+
+        if (idx >= s->total) {
             if (s->loop) {
-                s->offset = 0;
+                s->position_q16 = 0;
+                idx = 0;
+                frac = 0;
             } else {
                 buf[i] = 0;
-
-                // Apagar automáticamente al terminar
                 sound_player_stop_internal();
 
-                // Rellenar el resto del buffer con silencio
                 for (size_t j = i + 1; j < n; j++) {
                     buf[j] = 0;
                 }
                 return;
             }
-        } else {
-            buf[i] = s->data[s->offset++];
         }
+
+        int16_t s0 = s->data[idx];
+        int16_t s1 = (idx + 1 < s->total) ? s->data[idx + 1] : s0;
+
+        int32_t interp =
+            ((int32_t)s0 * (int32_t)(65536U - frac) +
+             (int32_t)s1 * (int32_t)frac) >> 16;
+
+        buf[i] = (int16_t)interp;
+        s->position_q16 += s->step_q16;
     }
 }
 
@@ -114,7 +130,9 @@ bool sound_player_play(const char *sound_name)
         if (strcmp(sound_table[i].name, sound_name) == 0) {
             sound_state.data = sound_table[i].data;
             sound_state.total = sound_table[i].len;
-            sound_state.offset = 0;
+            sound_state.source_sample_rate = sound_table[i].sample_rate;
+            sound_state.position_q16 = 0;
+            sound_state.step_q16 = compute_step_q16(sound_table[i].sample_rate);
             sound_state.loop = false;
             sound_state.playing = true;
 
