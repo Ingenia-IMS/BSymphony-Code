@@ -3,7 +3,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "sound_player.h"
+#include "sonido/sound_player.h"
 #include "leds/led_manager.h"
 
 void app_main(void)
@@ -17,10 +17,6 @@ void app_main(void)
 
     while (1) {
         switch (step % 6) {
-            case 0:
-                led_manager_set_solid(LED_COLOR_BLUE);
-                led_manager_set_blink_enabled(false);
-                break;
 
             case 1:
                 led_manager_set_diagonal_dual(LED_COLOR_BLUE, LED_COLOR_GREEN);
@@ -29,13 +25,12 @@ void app_main(void)
 
             case 2:
                 led_manager_set_storm();
-                sound_player_play("Tormenta");
                 led_manager_set_blink_enabled(false);
                 break;
 
             case 3:
                 led_manager_set_fire();
-                led_manager_set_blink_enabled(true);
+                led_manager_set_blink_enabled(false);
                 break;
 
             case 4:
@@ -45,7 +40,7 @@ void app_main(void)
 
             case 5:
                 led_manager_set_rainbow();
-                led_manager_set_blink_enabled(true);
+                led_manager_set_blink_enabled(false);
                 break;
         }
 
