@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 # Cambia este valor si quieres dejar fija la frecuencia de muestreo por defecto.
-DEFAULT_SAMPLE_RATE = 24000
+DEFAULT_SAMPLE_RATE = 12000
 
 # Extensiones de audio aceptadas.
 SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac"}
