@@ -3,7 +3,6 @@
 #include "../sounds_h/music.h"
 
 #define SOUND_LIST \
-
     X(music)
 
 #define X(name) { #name, audio_##name, audio_##name##_len, audio_##name##_sample_rate },
