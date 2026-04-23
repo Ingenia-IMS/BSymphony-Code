@@ -22,6 +22,7 @@ void app_main(void)
                 led_manager_set_diagonal_dual(LED_COLOR_BLUE, LED_COLOR_GREEN);
                 led_manager_set_blink_enabled(false);
                 break;
+                
 
             case 2:
                 led_manager_set_storm();
