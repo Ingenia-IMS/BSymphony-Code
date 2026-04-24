@@ -1,11 +1,14 @@
 #include "imu_manager.h"
+
 #include "driver/i2c_master.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
 #include <stdint.h>
+#include <stdbool.h>
 
 // -----------------------------------------------------------------------------
-// CONFIG
+// CONFIG I2C / MPU
 // -----------------------------------------------------------------------------
 
 #define I2C_PORT        I2C_NUM_0
@@ -16,6 +19,21 @@
 #define REG_PWR_MGMT_1  0x6B
 #define REG_ACCEL_XOUT  0x3B
 
+// -----------------------------------------------------------------------------
+// CONFIG SENSIBILIDAD
+// -----------------------------------------------------------------------------
+
+#define SOUND_COOLDOWN_MS           5000
+
+#define PICKUP_GYRO_MIN             9000
+#define PICKUP_ACCEL_DELTA_MIN      70000000
+
+#define SHAKE_GYRO_MIN              35000
+#define SHAKE_REQUIRED_COUNT        6
+#define SHAKE_RESET_GYRO_MAX        12000
+
+// -----------------------------------------------------------------------------
+// VARIABLES INTERNAS
 // -----------------------------------------------------------------------------
 
 static i2c_master_bus_handle_t bus;
@@ -31,21 +49,14 @@ static int32_t prev_accel_norm = 0;
 static int32_t accel_delta = 0;
 static int32_t gyro_activity = 0;
 
-// estado
-static bool in_hand = false;
-static bool on_table = true;
-
 // eventos
-static bool hit_event = false;
-static bool shake_event = false;
-static bool pickup_event = false;
-static bool putdown_event = false;
+static bool sound_event = false;
+static bool blink_event = false;
 
-// contadores
-static int stable_counter = 0;
-static int moving_counter = 0;
+// control
+static uint32_t last_sound_ms = 0;
 static int shake_counter = 0;
-static int hit_cooldown = 0;
+static bool first_sample = true;
 
 // -----------------------------------------------------------------------------
 // UTIL
@@ -59,6 +70,11 @@ static int32_t iabs32(int32_t x)
 static int16_t to_i16(uint8_t h, uint8_t l)
 {
     return (int16_t)((h << 8) | l);
+}
+
+static uint32_t now_ms(void)
+{
+    return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
 
 // -----------------------------------------------------------------------------
@@ -128,60 +144,42 @@ void imu_update(void)
     gz = to_i16(raw[12], raw[13]);
 
     prev_accel_norm = accel_norm;
-    accel_norm = (int32_t)ax*ax + (int32_t)ay*ay + (int32_t)az*az;
+    accel_norm = (int32_t)ax * ax + (int32_t)ay * ay + (int32_t)az * az;
 
     accel_delta = iabs32(accel_norm - prev_accel_norm);
     gyro_activity = iabs32(gx) + iabs32(gy) + iabs32(gz);
 
-    // -------------------------
-    // MESA (quieto)
-    // -------------------------
-    if (gyro_activity < 800 && accel_delta < 20000000) {
-        stable_counter++;
+    if (first_sample) {
+        first_sample = false;
+        prev_accel_norm = accel_norm;
+        return;
+    }
 
-        if (stable_counter > 20 && !on_table) {
-            on_table = true;
-            in_hand = false;
-            putdown_event = true;
-        }
-    } else {
-        stable_counter = 0;
+    uint32_t now = now_ms();
+
+    // -------------------------
+    // SONIDO (movimiento fuerte)
+    // -------------------------
+    bool movimiento_claro =
+        (gyro_activity > PICKUP_GYRO_MIN) ||
+        (accel_delta > PICKUP_ACCEL_DELTA_MIN);
+
+    if (movimiento_claro && (now - last_sound_ms >= SOUND_COOLDOWN_MS)) {
+        sound_event = true;
+        last_sound_ms = now;
     }
 
     // -------------------------
-    // MANO (movimiento)
+    // SHAKE (sacudida vigorosa)
     // -------------------------
-    if (gyro_activity > 4000 || accel_delta > 30000000) {
-        moving_counter++;
-
-        if (moving_counter > 5 && !in_hand) {
-            in_hand = true;
-            if (on_table) pickup_event = true;
-            on_table = false;
-        }
-    } else {
-        moving_counter = 0;
-    }
-
-    // -------------------------
-    // GOLPE
-    // -------------------------
-    if (hit_cooldown > 0) hit_cooldown--;
-
-    if (accel_delta > 80000000 && hit_cooldown == 0) {
-        hit_event = true;
-        hit_cooldown = 20;
-    }
-
-    // -------------------------
-    // SHAKE
-    // -------------------------
-    if (gyro_activity > 8000) {
+    if (gyro_activity > SHAKE_GYRO_MIN) {
         shake_counter++;
+    } else if (gyro_activity < SHAKE_RESET_GYRO_MAX) {
+        shake_counter = 0;
     }
 
-    if (shake_counter > 3) {
-        shake_event = true;
+    if (shake_counter >= SHAKE_REQUIRED_COUNT) {
+        blink_event = true;
         shake_counter = 0;
     }
 }
@@ -190,44 +188,16 @@ void imu_update(void)
 // EVENTOS
 // -----------------------------------------------------------------------------
 
-bool imu_take_hit_event(void)
+bool imu_take_sound_event(void)
 {
-    bool v = hit_event;
-    hit_event = false;
+    bool v = sound_event;
+    sound_event = false;
     return v;
 }
 
-bool imu_take_shake_event(void)
+bool imu_take_blink_event(void)
 {
-    bool v = shake_event;
-    shake_event = false;
+    bool v = blink_event;
+    blink_event = false;
     return v;
-}
-
-bool imu_take_pickup_event(void)
-{
-    bool v = pickup_event;
-    pickup_event = false;
-    return v;
-}
-
-bool imu_take_putdown_event(void)
-{
-    bool v = putdown_event;
-    putdown_event = false;
-    return v;
-}
-
-// -----------------------------------------------------------------------------
-// ESTADO
-// -----------------------------------------------------------------------------
-
-bool imu_is_in_hand(void)
-{
-    return in_hand;
-}
-
-bool imu_is_on_table(void)
-{
-    return on_table;
 }
