@@ -3,10 +3,23 @@
 
 #include <stdbool.h>
 
-void imu_init(void);
-void imu_update(void);
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-bool imu_take_sound_event(void);
-bool imu_take_blink_event(void);
+typedef void (*imu_event_callback_t)(void);
+
+void imu_init(void);
+
+/* Callbacks */
+void imu_set_pickup_callback(imu_event_callback_t cb);
+void imu_set_shake_callback(imu_event_callback_t cb);
+
+/* Arranca la task interna de la IMU */
+void imu_start_task(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

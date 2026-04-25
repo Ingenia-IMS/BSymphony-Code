@@ -1,11 +1,17 @@
-#include "imu_manager.h"
+#include "imu/imu_manager.h"
 
 #include "driver/i2c_master.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "esp_log.h"
+
 #include <stdint.h>
 #include <stdbool.h>
+
+// -----------------------------------------------------------------------------
+// CONFIG I2C / MPU
+// -----------------------------------------------------------------------------
 
 #define I2C_PORT        I2C_NUM_0
 #define SDA_GPIO        22
@@ -15,17 +21,44 @@
 #define REG_PWR_MGMT_1  0x6B
 #define REG_ACCEL_XOUT  0x3B
 
-#define SOUND_COOLDOWN_MS           5000
+// -----------------------------------------------------------------------------
+// TASK
+// -----------------------------------------------------------------------------
 
-#define PICKUP_GYRO_MIN             9000
-#define PICKUP_ACCEL_DELTA_MIN      70000000
+#define IMU_TASK_STACK_WORDS    4096
+#define IMU_TASK_PRIORITY       4
+#define IMU_PERIOD_MS           20
 
-#define SHAKE_GYRO_MIN              35000
-#define SHAKE_REQUIRED_COUNT        6
-#define SHAKE_RESET_GYRO_MAX        12000
+// -----------------------------------------------------------------------------
+// DETECCIÓN
+// -----------------------------------------------------------------------------
+
+// Coger / mover suave -> sonido
+#define PICKUP_COOLDOWN_MS          5000
+#define PICKUP_GYRO_MIN             8000
+#define PICKUP_ACCEL_DELTA_MIN      45000000
+#define PICKUP_REQUIRED_COUNT       3
+
+// Agitar vigorosamente -> parpadeo
+#define SHAKE_GYRO_MIN              70000
+#define SHAKE_ACCEL_DELTA_MIN       250000000
+#define SHAKE_REQUIRED_PEAKS        5
+#define SHAKE_WINDOW_MS             900
+#define SHAKE_MIN_PEAK_GAP_MS       80
+
+static const char *TAG = "IMU";
+
+// -----------------------------------------------------------------------------
+// VARIABLES INTERNAS
+// -----------------------------------------------------------------------------
 
 static i2c_master_bus_handle_t bus;
 static i2c_master_dev_handle_t dev;
+
+static TaskHandle_t imu_task_handle = NULL;
+
+static imu_event_callback_t pickup_callback = NULL;
+static imu_event_callback_t shake_callback = NULL;
 
 static int16_t ax, ay, az;
 static int16_t gx, gy, gz;
@@ -35,12 +68,18 @@ static int32_t prev_accel_norm = 0;
 static int32_t accel_delta = 0;
 static int32_t gyro_activity = 0;
 
-static bool sound_event = false;
-static bool blink_event = false;
-
-static uint32_t last_sound_ms = 0;
-static int shake_counter = 0;
 static bool first_sample = true;
+
+static uint32_t last_pickup_ms = 0;
+static int pickup_counter = 0;
+
+static uint32_t shake_window_start_ms = 0;
+static uint32_t last_shake_peak_ms = 0;
+static int shake_peak_count = 0;
+
+// -----------------------------------------------------------------------------
+// UTILS
+// -----------------------------------------------------------------------------
 
 static int32_t iabs32(int32_t x)
 {
@@ -57,7 +96,11 @@ static uint32_t now_ms(void)
     return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
 
-static void i2c_init(void)
+// -----------------------------------------------------------------------------
+// I2C / MPU
+// -----------------------------------------------------------------------------
+
+static void i2c_init_internal(void)
 {
     i2c_master_bus_config_t cfg = {
         .i2c_port = I2C_PORT,
@@ -89,14 +132,35 @@ static void mpu_read(uint8_t reg, uint8_t *data, int len)
     i2c_master_transmit_receive(dev, &reg, 1, data, len, -1);
 }
 
+// -----------------------------------------------------------------------------
+// INIT / CALLBACKS
+// -----------------------------------------------------------------------------
+
 void imu_init(void)
 {
-    i2c_init();
+    i2c_init_internal();
+
     mpu_write(REG_PWR_MGMT_1, 0x00);
     vTaskDelay(pdMS_TO_TICKS(100));
+
+    ESP_LOGI(TAG, "IMU inicializada");
 }
 
-void imu_update(void)
+void imu_set_pickup_callback(imu_event_callback_t cb)
+{
+    pickup_callback = cb;
+}
+
+void imu_set_shake_callback(imu_event_callback_t cb)
+{
+    shake_callback = cb;
+}
+
+// -----------------------------------------------------------------------------
+// LECTURA + DETECCIÓN
+// -----------------------------------------------------------------------------
+
+static void imu_read_sample(void)
 {
     uint8_t raw[14];
     mpu_read(REG_ACCEL_XOUT, raw, 14);
@@ -110,6 +174,7 @@ void imu_update(void)
     gz = to_i16(raw[12], raw[13]);
 
     prev_accel_norm = accel_norm;
+
     accel_norm =
         (int32_t)ax * ax +
         (int32_t)ay * ay +
@@ -121,52 +186,129 @@ void imu_update(void)
     if (first_sample) {
         first_sample = false;
         prev_accel_norm = accel_norm;
+        accel_delta = 0;
+    }
+}
+
+static void detect_pickup(uint32_t now, bool strong_shake_sample)
+{
+    bool pickup_motion =
+        !strong_shake_sample &&
+        (
+            gyro_activity > PICKUP_GYRO_MIN ||
+            accel_delta > PICKUP_ACCEL_DELTA_MIN
+        );
+
+    if (pickup_motion) {
+        pickup_counter++;
+    } else {
+        pickup_counter = 0;
+    }
+
+    if (pickup_counter >= PICKUP_REQUIRED_COUNT &&
+        now - last_pickup_ms >= PICKUP_COOLDOWN_MS) {
+
+        ESP_LOGI(
+            TAG,
+            "DETECTADO COGER/MOVER SUAVE -> sonido | gyro=%ld accel_delta=%ld",
+            (long)gyro_activity,
+            (long)accel_delta
+        );
+
+        last_pickup_ms = now;
+        pickup_counter = 0;
+
+        if (pickup_callback != NULL) {
+            pickup_callback();
+        }
+    }
+}
+
+static void detect_shake(uint32_t now, bool strong_shake_sample)
+{
+    if (!strong_shake_sample) {
+        if (now - shake_window_start_ms > SHAKE_WINDOW_MS) {
+            shake_peak_count = 0;
+            shake_window_start_ms = 0;
+        }
         return;
     }
 
-    uint32_t now = now_ms();
+    if (shake_peak_count == 0) {
+        shake_window_start_ms = now;
+        last_shake_peak_ms = now;
+        shake_peak_count = 1;
+    } else {
+        bool inside_window = (now - shake_window_start_ms) <= SHAKE_WINDOW_MS;
+        bool enough_gap = (now - last_shake_peak_ms) >= SHAKE_MIN_PEAK_GAP_MS;
 
-    // -------------------------------------------------
-    // COGER EL CUBO -> PARPADEO
-    // Antes esto disparaba sonido.
-    // -------------------------------------------------
-    bool movimiento_claro =
-        (gyro_activity > PICKUP_GYRO_MIN) ||
-        (accel_delta > PICKUP_ACCEL_DELTA_MIN);
-
-    if (movimiento_claro) {
-        blink_event = true;
+        if (!inside_window) {
+            shake_window_start_ms = now;
+            last_shake_peak_ms = now;
+            shake_peak_count = 1;
+        } else if (enough_gap) {
+            last_shake_peak_ms = now;
+            shake_peak_count++;
+        }
     }
 
-    // -------------------------------------------------
-    // AGITACIÓN VIGOROSA -> SONIDO
-    // Antes esto disparaba parpadeo.
-    // -------------------------------------------------
-    if (gyro_activity > SHAKE_GYRO_MIN) {
-        shake_counter++;
-    } else if (gyro_activity < SHAKE_RESET_GYRO_MAX) {
-        shake_counter = 0;
-    }
+    if (shake_peak_count >= SHAKE_REQUIRED_PEAKS) {
+        ESP_LOGI(
+            TAG,
+            "DETECTADO AGITADO VIGOROSO -> parpadeo | gyro=%ld accel_delta=%ld peaks=%d",
+            (long)gyro_activity,
+            (long)accel_delta,
+            shake_peak_count
+        );
 
-    if (shake_counter >= SHAKE_REQUIRED_COUNT &&
-        (now - last_sound_ms >= SOUND_COOLDOWN_MS)) {
+        shake_peak_count = 0;
+        shake_window_start_ms = 0;
+        last_shake_peak_ms = 0;
 
-        sound_event = true;
-        last_sound_ms = now;
-        shake_counter = 0;
+        if (shake_callback != NULL) {
+            shake_callback();
+        }
     }
 }
 
-bool imu_take_sound_event(void)
+// -----------------------------------------------------------------------------
+// TASK
+// -----------------------------------------------------------------------------
+
+static void imu_task(void *arg)
 {
-    bool v = sound_event;
-    sound_event = false;
-    return v;
+    (void)arg;
+
+    ESP_LOGI(TAG, "Task IMU arrancada");
+
+    while (1) {
+        imu_read_sample();
+
+        uint32_t now = now_ms();
+
+        bool strong_shake_sample =
+            gyro_activity > SHAKE_GYRO_MIN &&
+            accel_delta > SHAKE_ACCEL_DELTA_MIN;
+
+        detect_shake(now, strong_shake_sample);
+        detect_pickup(now, strong_shake_sample);
+
+        vTaskDelay(pdMS_TO_TICKS(IMU_PERIOD_MS));
+    }
 }
 
-bool imu_take_blink_event(void)
+void imu_start_task(void)
 {
-    bool v = blink_event;
-    blink_event = false;
-    return v;
+    if (imu_task_handle != NULL) {
+        return;
+    }
+
+    xTaskCreate(
+        imu_task,
+        "imu_task",
+        IMU_TASK_STACK_WORDS,
+        NULL,
+        IMU_TASK_PRIORITY,
+        &imu_task_handle
+    );
 }
