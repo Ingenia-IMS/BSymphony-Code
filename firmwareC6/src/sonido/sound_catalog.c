@@ -1,9 +1,9 @@
 #include "sound_catalog.h"
 
-#include "../sounds_h/music.h"
+#include "../sounds_h/tormenta.h"
 
 #define SOUND_LIST \
-    X(music)
+    X(tormenta)
 
 #define X(name) { #name, audio_##name, audio_##name##_len, audio_##name##_sample_rate },
 

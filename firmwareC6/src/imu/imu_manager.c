@@ -7,10 +7,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// -----------------------------------------------------------------------------
-// CONFIG I2C / MPU
-// -----------------------------------------------------------------------------
-
 #define I2C_PORT        I2C_NUM_0
 #define SDA_GPIO        22
 #define SCL_GPIO        23
@@ -18,10 +14,6 @@
 
 #define REG_PWR_MGMT_1  0x6B
 #define REG_ACCEL_XOUT  0x3B
-
-// -----------------------------------------------------------------------------
-// CONFIG SENSIBILIDAD
-// -----------------------------------------------------------------------------
 
 #define SOUND_COOLDOWN_MS           5000
 
@@ -32,35 +24,23 @@
 #define SHAKE_REQUIRED_COUNT        6
 #define SHAKE_RESET_GYRO_MAX        12000
 
-// -----------------------------------------------------------------------------
-// VARIABLES INTERNAS
-// -----------------------------------------------------------------------------
-
 static i2c_master_bus_handle_t bus;
 static i2c_master_dev_handle_t dev;
 
-// datos
 static int16_t ax, ay, az;
 static int16_t gx, gy, gz;
 
-// métricas
 static int32_t accel_norm = 0;
 static int32_t prev_accel_norm = 0;
 static int32_t accel_delta = 0;
 static int32_t gyro_activity = 0;
 
-// eventos
 static bool sound_event = false;
 static bool blink_event = false;
 
-// control
 static uint32_t last_sound_ms = 0;
 static int shake_counter = 0;
 static bool first_sample = true;
-
-// -----------------------------------------------------------------------------
-// UTIL
-// -----------------------------------------------------------------------------
 
 static int32_t iabs32(int32_t x)
 {
@@ -76,10 +56,6 @@ static uint32_t now_ms(void)
 {
     return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
-
-// -----------------------------------------------------------------------------
-// I2C + MPU
-// -----------------------------------------------------------------------------
 
 static void i2c_init(void)
 {
@@ -113,23 +89,12 @@ static void mpu_read(uint8_t reg, uint8_t *data, int len)
     i2c_master_transmit_receive(dev, &reg, 1, data, len, -1);
 }
 
-// -----------------------------------------------------------------------------
-// INIT
-// -----------------------------------------------------------------------------
-
 void imu_init(void)
 {
     i2c_init();
-
-    // despertar MPU
     mpu_write(REG_PWR_MGMT_1, 0x00);
-
     vTaskDelay(pdMS_TO_TICKS(100));
 }
-
-// -----------------------------------------------------------------------------
-// UPDATE
-// -----------------------------------------------------------------------------
 
 void imu_update(void)
 {
@@ -139,12 +104,16 @@ void imu_update(void)
     ax = to_i16(raw[0], raw[1]);
     ay = to_i16(raw[2], raw[3]);
     az = to_i16(raw[4], raw[5]);
+
     gx = to_i16(raw[8], raw[9]);
     gy = to_i16(raw[10], raw[11]);
     gz = to_i16(raw[12], raw[13]);
 
     prev_accel_norm = accel_norm;
-    accel_norm = (int32_t)ax * ax + (int32_t)ay * ay + (int32_t)az * az;
+    accel_norm =
+        (int32_t)ax * ax +
+        (int32_t)ay * ay +
+        (int32_t)az * az;
 
     accel_delta = iabs32(accel_norm - prev_accel_norm);
     gyro_activity = iabs32(gx) + iabs32(gy) + iabs32(gz);
@@ -157,36 +126,36 @@ void imu_update(void)
 
     uint32_t now = now_ms();
 
-    // -------------------------
-    // SONIDO (movimiento fuerte)
-    // -------------------------
+    // -------------------------------------------------
+    // COGER EL CUBO -> PARPADEO
+    // Antes esto disparaba sonido.
+    // -------------------------------------------------
     bool movimiento_claro =
         (gyro_activity > PICKUP_GYRO_MIN) ||
         (accel_delta > PICKUP_ACCEL_DELTA_MIN);
 
-    if (movimiento_claro && (now - last_sound_ms >= SOUND_COOLDOWN_MS)) {
-        sound_event = true;
-        last_sound_ms = now;
+    if (movimiento_claro) {
+        blink_event = true;
     }
 
-    // -------------------------
-    // SHAKE (sacudida vigorosa)
-    // -------------------------
+    // -------------------------------------------------
+    // AGITACIÓN VIGOROSA -> SONIDO
+    // Antes esto disparaba parpadeo.
+    // -------------------------------------------------
     if (gyro_activity > SHAKE_GYRO_MIN) {
         shake_counter++;
     } else if (gyro_activity < SHAKE_RESET_GYRO_MAX) {
         shake_counter = 0;
     }
 
-    if (shake_counter >= SHAKE_REQUIRED_COUNT) {
-        blink_event = true;
+    if (shake_counter >= SHAKE_REQUIRED_COUNT &&
+        (now - last_sound_ms >= SOUND_COOLDOWN_MS)) {
+
+        sound_event = true;
+        last_sound_ms = now;
         shake_counter = 0;
     }
 }
-
-// -----------------------------------------------------------------------------
-// EVENTOS
-// -----------------------------------------------------------------------------
 
 bool imu_take_sound_event(void)
 {

@@ -21,7 +21,7 @@
 #define LED_RMT_RESOLUTION_HZ     (10 * 1000 * 1000)
 
 /* Parpadeo independiente: 2 ciclos por segundo -> periodo total 500 ms */
-#define BLINK_HALF_PERIOD_MS      250
+#define BLINK_HALF_PERIOD_MS      125
 
 /* Si el orden físico no coincide con el cuadrado que imaginas,
    cambia estos índices. Supuesto actual:
