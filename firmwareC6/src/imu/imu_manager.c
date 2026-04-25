@@ -40,8 +40,13 @@
 #define PICKUP_REQUIRED_COUNT       3
 
 // Agitar vigorosamente -> parpadeo
+/* Estos valores iban bien, un poco duro pero correcto
 #define SHAKE_GYRO_MIN              70000
 #define SHAKE_ACCEL_DELTA_MIN       250000000
+*/
+#define SHAKE_GYRO_MIN              65000
+#define SHAKE_ACCEL_DELTA_MIN       230000000
+
 #define SHAKE_REQUIRED_PEAKS        5
 #define SHAKE_WINDOW_MS             900
 #define SHAKE_MIN_PEAK_GAP_MS       80

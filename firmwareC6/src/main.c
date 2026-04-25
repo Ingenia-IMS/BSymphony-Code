@@ -1,6 +1,3 @@
-#include <stdbool.h>
-#include <stdint.h>
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 
@@ -9,41 +6,48 @@
 #include "imu/imu_manager.h"
 #include "leds/led_manager.h"
 #include "sonido/sound_player.h"
+#include "elementos/element_catalog.h"
 
-#define SOUND_NAME          "tormenta"
-#define BLINK_DURATION_MS   5000
+#define CHANGE_BLINK_DURATION_MS    1000
 
 static const char *TAG = "MAIN";
 
-static TimerHandle_t blink_timer = NULL;
+static TimerHandle_t change_element_timer = NULL;
 
-static void stop_blink_timer_callback(TimerHandle_t timer)
+static void change_element_timer_callback(TimerHandle_t timer)
 {
     (void)timer;
 
-    ESP_LOGI(TAG, "Fin de parpadeo -> volver a tormenta fija");
+    ESP_LOGI(TAG, "Fin de parpadeo -> cambiar elemento");
 
     led_manager_set_blink_enabled(false);
+
+    element_catalog_next();
+    element_catalog_apply_light();
+    element_catalog_play_sound();
 }
 
 static void on_pickup_detected(void)
 {
-    ESP_LOGI(TAG, "Callback IMU: coger/mover suave -> reproducir sonido");
+    ESP_LOGI(
+        TAG,
+        "Callback IMU: coger/mover suave -> sonido del elemento actual: %s",
+        element_catalog_get_current_name()
+    );
 
-    // Se mantiene tu comportamiento deseado:
-    // si ya hay un sonido, sound_player_play debe cortar el anterior y lanzar este.
-    sound_player_play(SOUND_NAME);
+    element_catalog_play_sound();
 }
 
 static void on_strong_shake_detected(void)
 {
-    ESP_LOGI(TAG, "Callback IMU: agitado vigoroso -> parpadeo tormenta 5s");
+    ESP_LOGI(TAG, "Callback IMU: agitado vigoroso -> parpadeo 3s y cambio de elemento");
 
+    element_catalog_apply_light();
     led_manager_set_blink_enabled(true);
 
-    if (blink_timer != NULL) {
-        xTimerStop(blink_timer, 0);
-        xTimerStart(blink_timer, 0);
+    if (change_element_timer != NULL) {
+        xTimerStop(change_element_timer, 0);
+        xTimerStart(change_element_timer, 0);
     }
 }
 
@@ -59,22 +63,20 @@ void app_main(void)
 
     led_manager_set_master_brightness(80);
 
-    // Estado normal: tormenta fija
-    led_manager_set_solid(LED_COLOR_BLUE);
-    led_manager_set_blink_enabled(false);
-
     sound_player_init();
 
-    blink_timer = xTimerCreate(
-        "blink_timer",
-        pdMS_TO_TICKS(BLINK_DURATION_MS),
+    element_catalog_init();
+
+    change_element_timer = xTimerCreate(
+        "change_element_timer",
+        pdMS_TO_TICKS(CHANGE_BLINK_DURATION_MS),
         pdFALSE,
         NULL,
-        stop_blink_timer_callback
+        change_element_timer_callback
     );
 
-    if (blink_timer == NULL) {
-        ESP_LOGE(TAG, "No se pudo crear blink_timer");
+    if (change_element_timer == NULL) {
+        ESP_LOGE(TAG, "No se pudo crear change_element_timer");
     }
 
     imu_set_pickup_callback(on_pickup_detected);
@@ -83,5 +85,5 @@ void app_main(void)
     imu_start_task();
 
     ESP_LOGI(TAG, "Sistema listo");
-    ESP_LOGI(TAG, "Main sin bucle periódico: IMU, LEDs y audio trabajan en tasks");
+    ESP_LOGI(TAG, "Elemento actual: %s", element_catalog_get_current_name());
 }
