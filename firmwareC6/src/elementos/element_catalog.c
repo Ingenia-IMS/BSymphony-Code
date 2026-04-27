@@ -1,6 +1,7 @@
 #include "elementos/element_catalog.h"
 
 #include <stddef.h>
+#include <string.h>
 
 #include "esp_log.h"
 
@@ -57,8 +58,6 @@ static void light_pajaro(void)
 {
     led_manager_set_solid(LED_COLOR_CYAN);
 }
-
-// Declaradas ya para cuando metas la otra mitad de sonidos
 
 static void light_piedra(void)
 {
@@ -125,24 +124,14 @@ static const size_t element_count =
 
 
 // -----------------------------------------------------------------------------
-// FUNCIONES PÚBLICAS
-// -----------------------------------------------------------------------------
 
-void element_catalog_init(void)
+const element_t *element_catalog_get_by_name(const char *name)
 {
-    ESP_LOGI(TAG, "Catálogo inicializado. Elementos: %u", (unsigned)element_count);
-}
-
-const element_t *element_catalog_get_by_index(size_t index)
-{
-    if (index >= element_count) {
-        return NULL;
+    for (size_t i = 0; i < element_count; i++) {
+        if (strcmp(element_list[i].name, name) == 0) {
+            return &element_list[i];
+        }
     }
 
-    return &element_list[index];
-}
-
-size_t element_catalog_get_count(void)
-{
-    return element_count;
+    return NULL;
 }

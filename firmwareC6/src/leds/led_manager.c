@@ -477,6 +477,8 @@ esp_err_t led_manager_init(void)
         &s_led.task_handle
     );
 
+    led_manager_set_master_brightness(100);
+
     if (ok != pdPASS) {
         return ESP_FAIL;
     }

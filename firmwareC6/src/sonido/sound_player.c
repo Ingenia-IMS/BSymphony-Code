@@ -122,10 +122,10 @@ void sound_player_init(void)
 bool sound_player_play(const char *sound_name)
 {
     if (sound_state.playing) {
-        return false;
+        sound_player_stop_internal();
     }
 
-    if (sound_name == NULL) {
+        if (sound_name == NULL) {
         sound_player_stop_internal();
         return false;
     }

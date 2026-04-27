@@ -1,5 +1,7 @@
+#include <stddef.h>
+
 #include "freertos/FreeRTOS.h"
-#include "freertos/timers.h"
+#include "freertos/task.h"
 
 #include "esp_log.h"
 
@@ -9,29 +11,73 @@
 #include "elementos/element_catalog.h"
 #include "elementos/cube_state.h"
 
-#define CHANGE_BLINK_DURATION_MS 1000
+#define MAIN_TASK_DELAY_MS 20
 
 static const char *TAG = "MAIN";
 
-static TimerHandle_t change_element_timer = NULL;
+static const char *element_sequence[] = {
+    "agua",      
+    "electricidad",
+    "fuego",     
+    "humano",    
+    "metal",     
+    "mono",      
+    "naturaleza",
+    "oeste",     
+    "pajaro",    
+    "piedra",    
+    "pistola",   
+    "reggaeton", 
+    "robot",     
+    "rock",      
+    "tormenta",  
+    "viento",    
+};
 
-static void change_element_timer_callback(TimerHandle_t timer)
+static const size_t element_sequence_count =
+    sizeof(element_sequence) / sizeof(element_sequence[0]);
+
+static size_t current_sequence_index = 0;
+
+static void change_to_sequence_element(size_t index)
 {
-    (void)timer;
+    if (element_sequence_count == 0) {
+        ESP_LOGE(TAG, "La secuencia de elementos está vacía");
+        return;
+    }
 
-    ESP_LOGI(TAG, "Fin de parpadeo -> cambiar elemento");
+    if (index >= element_sequence_count) {
+        index = 0;
+    }
 
-    led_manager_set_blink_enabled(false);
+    const char *element_name = element_sequence[index];
 
-    cube_state_next_element();
-    cube_state_play_current_sound();
+    ESP_LOGI(TAG, "Cambiando a elemento de la secuencia: %s", element_name);
+
+    if (cube_state_set_element_by_name(element_name)) {
+        cube_state_play_current_sound();
+        current_sequence_index = index;
+    } else {
+        ESP_LOGW(TAG, "El elemento '%s' no existe en el catálogo", element_name);
+    }
+}
+
+static void change_to_next_sequence_element(void)
+{
+    size_t next_index = current_sequence_index + 1;
+
+    if (next_index >= element_sequence_count) {
+        next_index = 0;
+    }
+
+    change_to_sequence_element(next_index);
 }
 
 static void on_pickup_detected(void)
 {
     ESP_LOGI(
         TAG,
-        "Callback IMU: coger/mover suave -> sonido del elemento actual: %s",
+        "Mover suave -> sonido del elemento actual: %s",
         cube_state_get_current_name()
     );
 
@@ -40,15 +86,9 @@ static void on_pickup_detected(void)
 
 static void on_strong_shake_detected(void)
 {
-    ESP_LOGI(TAG, "Callback IMU: agitado vigoroso -> parpadeo y cambio de elemento");
+    ESP_LOGI(TAG, "Agitado vigoroso -> siguiente elemento de la secuencia");
 
-    cube_state_apply_current_light();
-    led_manager_set_blink_enabled(true);
-
-    if (change_element_timer != NULL) {
-        xTimerStop(change_element_timer, 0);
-        xTimerStart(change_element_timer, 0);
-    }
+    change_to_next_sequence_element();
 }
 
 void app_main(void)
@@ -56,35 +96,20 @@ void app_main(void)
     ESP_LOGI(TAG, "Inicializando sistema...");
 
     imu_init();
-
-    if (led_manager_init() != ESP_OK) {
-        ESP_LOGE(TAG, "Error inicializando LEDs");
-    }
-
-    led_manager_set_master_brightness(80);
-
+    led_manager_init();
     sound_player_init();
-
-    element_catalog_init();
     cube_state_init();
-
-    change_element_timer = xTimerCreate(
-        "change_element_timer",
-        pdMS_TO_TICKS(CHANGE_BLINK_DURATION_MS),
-        pdFALSE,
-        NULL,
-        change_element_timer_callback
-    );
-
-    if (change_element_timer == NULL) {
-        ESP_LOGE(TAG, "No se pudo crear change_element_timer");
-    }
 
     imu_set_pickup_callback(on_pickup_detected);
     imu_set_shake_callback(on_strong_shake_detected);
 
     imu_start_task();
 
-    ESP_LOGI(TAG, "Sistema listo");
+    change_to_sequence_element(0);
+
     ESP_LOGI(TAG, "Elemento actual: %s", cube_state_get_current_name());
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(MAIN_TASK_DELAY_MS));
+    }
 }

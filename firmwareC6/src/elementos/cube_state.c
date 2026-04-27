@@ -8,93 +8,52 @@
 
 static const char *TAG = "CUBE_STATE";
 
-static unsigned int current_element_index = 0;
+static const element_t *current_element = NULL;
 
 void cube_state_init(void)
 {
-    current_element_index = 0;
-
-    cube_state_apply_current_light();
-
-    ESP_LOGI(TAG, "Elemento inicial: %s", cube_state_get_current_name());
+    cube_state_set_element_by_name("agua");
 }
 
-void cube_state_set_element_by_index(unsigned int index)
+bool cube_state_set_element_by_name(const char *element_name)
 {
-    size_t count = element_catalog_get_count();
+    const element_t *new_element = element_catalog_get_by_name(element_name);
 
-    if (count == 0) {
-        ESP_LOGE(TAG, "No hay elementos en el catálogo");
-        return;
+    if (new_element == NULL) {
+        ESP_LOGW(TAG, "Elemento no encontrado: %s", element_name);
+        return false;
     }
 
-    if (index >= count) {
-        ESP_LOGW(TAG, "Índice de elemento inválido: %u", index);
-        index = 0;
-    }
+    current_element = new_element;
 
-    current_element_index = index;
-
-    ESP_LOGI(TAG, "Nuevo elemento: %s", cube_state_get_current_name());
-
-    cube_state_apply_current_light();
-}
-
-void cube_state_next_element(void)
-{
-    size_t count = element_catalog_get_count();
-
-    if (count == 0) {
-        ESP_LOGE(TAG, "No hay elementos en el catálogo");
-        return;
-    }
-
-    unsigned int next_index = current_element_index + 1;
-
-    if (next_index >= count) {
-        next_index = 0;
-    }
-
-    cube_state_set_element_by_index(next_index);
-}
-
-void cube_state_apply_current_light(void)
-{
-    const element_t *element = element_catalog_get_by_index(current_element_index);
-
-    if (element == NULL) {
-        ESP_LOGE(TAG, "Elemento actual inválido");
-        return;
-    }
+    ESP_LOGI(TAG, "Elemento actual: %s", current_element->name);
 
     led_manager_set_blink_enabled(false);
 
-    if (element->apply_light != NULL) {
-        element->apply_light();
+    if (current_element->apply_light != NULL) {
+        current_element->apply_light();
     }
+
+    return true;
 }
 
 void cube_state_play_current_sound(void)
 {
-    const element_t *element = element_catalog_get_by_index(current_element_index);
-
-    if (element == NULL) {
-        ESP_LOGE(TAG, "Elemento actual inválido");
+    if (current_element == NULL) {
+        ESP_LOGW(TAG, "No hay elemento actual");
         return;
     }
 
-    ESP_LOGI(TAG, "Reproduciendo sonido: %s", element->name);
+    ESP_LOGI(TAG, "Reproduciendo sonido: %s", current_element->name);
 
-    sound_player_play(element->name);
+    sound_player_play(current_element->name);
 }
 
 const char *cube_state_get_current_name(void)
 {
-    const element_t *element = element_catalog_get_by_index(current_element_index);
-
-    if (element == NULL) {
-        return "desconocido";
+    if (current_element == NULL) {
+        return "ninguno";
     }
 
-    return element->name;
+    return current_element->name;
 }
