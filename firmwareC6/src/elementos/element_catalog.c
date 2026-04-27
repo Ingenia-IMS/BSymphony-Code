@@ -33,7 +33,12 @@ static void light_humano(void)
     led_manager_set_solid(LED_COLOR_WHITE);
 }
 
-static void light_monkey(void)
+static void light_metal(void)
+{
+    led_manager_set_solid(LED_COLOR_CYAN);
+}
+
+static void light_mono(void)
 {
     led_manager_set_solid(LED_COLOR_YELLOW);
 }
@@ -101,19 +106,18 @@ static const element_t element_list[] = {
     { "electricidad", light_electricidad },
     { "fuego",        light_fuego },
     { "humano",       light_humano },
-    { "monkey",       light_monkey },
+    { "metal",       light_metal },  
+    { "mono",       light_mono },
     { "naturaleza",   light_naturaleza },
     { "oeste",        light_oeste },
     { "pajaro",       light_pajaro },
-
-    // Deja estos comentados hasta meter sus .h en sound_catalog.c
-    // { "piedra",    light_piedra },
-    // { "pistola",   light_pistola },
-    // { "reggaeton", light_reggaeton },
-    // { "robot",     light_robot },
-    // { "rock",      light_rock },
-    // { "tormenta",  light_tormenta },
-    // { "viento",    light_viento },
+    { "piedra",    light_piedra },
+    { "pistola",   light_pistola },
+    { "reggaeton", light_reggaeton },
+    { "robot",     light_robot },
+    { "rock",      light_rock },
+    { "tormenta",  light_tormenta },
+    { "viento",    light_viento },
 };
 
 static const size_t element_count =
