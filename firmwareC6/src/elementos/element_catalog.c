@@ -123,7 +123,6 @@ static const element_t element_list[] = {
 static const size_t element_count =
     sizeof(element_list) / sizeof(element_list[0]);
 
-static size_t current_element_index = 0;
 
 // -----------------------------------------------------------------------------
 // FUNCIONES PÚBLICAS
@@ -131,52 +130,19 @@ static size_t current_element_index = 0;
 
 void element_catalog_init(void)
 {
-    current_element_index = 0;
-
-    element_catalog_apply_light();
-
-    ESP_LOGI(TAG, "Elemento inicial: %s", element_catalog_get_current_name());
+    ESP_LOGI(TAG, "Catálogo inicializado. Elementos: %u", (unsigned)element_count);
 }
 
-const element_t *element_catalog_get_current(void)
+const element_t *element_catalog_get_by_index(size_t index)
 {
-    return &element_list[current_element_index];
-}
-
-const element_t *element_catalog_next(void)
-{
-    current_element_index++;
-
-    if (current_element_index >= element_count) {
-        current_element_index = 0;
+    if (index >= element_count) {
+        return NULL;
     }
 
-    ESP_LOGI(TAG, "Nuevo elemento: %s", element_catalog_get_current_name());
-
-    return element_catalog_get_current();
+    return &element_list[index];
 }
 
-void element_catalog_apply_light(void)
+size_t element_catalog_get_count(void)
 {
-    const element_t *e = element_catalog_get_current();
-
-    led_manager_set_blink_enabled(false);
-
-    if (e->apply_light != NULL) {
-        e->apply_light();
-    }
-}
-
-void element_catalog_play_sound(void)
-{
-    const element_t *e = element_catalog_get_current();
-
-    ESP_LOGI(TAG, "Reproduciendo sonido: %s", e->name);
-
-    sound_player_play(e->name);
-}
-
-const char *element_catalog_get_current_name(void)
-{
-    return element_list[current_element_index].name;
+    return element_count;
 }

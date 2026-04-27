@@ -7,8 +7,9 @@
 #include "leds/led_manager.h"
 #include "sonido/sound_player.h"
 #include "elementos/element_catalog.h"
+#include "elementos/cube_state.h"
 
-#define CHANGE_BLINK_DURATION_MS    1000
+#define CHANGE_BLINK_DURATION_MS 1000
 
 static const char *TAG = "MAIN";
 
@@ -22,9 +23,8 @@ static void change_element_timer_callback(TimerHandle_t timer)
 
     led_manager_set_blink_enabled(false);
 
-    element_catalog_next();
-    element_catalog_apply_light();
-    element_catalog_play_sound();
+    cube_state_next_element();
+    cube_state_play_current_sound();
 }
 
 static void on_pickup_detected(void)
@@ -32,17 +32,17 @@ static void on_pickup_detected(void)
     ESP_LOGI(
         TAG,
         "Callback IMU: coger/mover suave -> sonido del elemento actual: %s",
-        element_catalog_get_current_name()
+        cube_state_get_current_name()
     );
 
-    element_catalog_play_sound();
+    cube_state_play_current_sound();
 }
 
 static void on_strong_shake_detected(void)
 {
-    ESP_LOGI(TAG, "Callback IMU: agitado vigoroso -> parpadeo 3s y cambio de elemento");
+    ESP_LOGI(TAG, "Callback IMU: agitado vigoroso -> parpadeo y cambio de elemento");
 
-    element_catalog_apply_light();
+    cube_state_apply_current_light();
     led_manager_set_blink_enabled(true);
 
     if (change_element_timer != NULL) {
@@ -66,6 +66,7 @@ void app_main(void)
     sound_player_init();
 
     element_catalog_init();
+    cube_state_init();
 
     change_element_timer = xTimerCreate(
         "change_element_timer",
@@ -85,5 +86,5 @@ void app_main(void)
     imu_start_task();
 
     ESP_LOGI(TAG, "Sistema listo");
-    ESP_LOGI(TAG, "Elemento actual: %s", element_catalog_get_current_name());
+    ESP_LOGI(TAG, "Elemento actual: %s", cube_state_get_current_name());
 }
