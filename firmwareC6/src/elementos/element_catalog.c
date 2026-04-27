@@ -101,22 +101,22 @@ static void light_viento(void)
 // -----------------------------------------------------------------------------
 
 static const element_t element_list[] = {
-    { "agua",         light_agua },
-    { "electricidad", light_electricidad },
-    { "fuego",        light_fuego },
-    { "humano",       light_humano },
-    { "metal",       light_metal },  
-    { "mono",       light_mono },
-    { "naturaleza",   light_naturaleza },
-    { "oeste",        light_oeste },
-    { "pajaro",       light_pajaro },
-    { "piedra",    light_piedra },
-    { "pistola",   light_pistola },
-    { "reggaeton", light_reggaeton },
-    { "robot",     light_robot },
-    { "rock",      light_rock },
-    { "tormenta",  light_tormenta },
-    { "viento",    light_viento },
+    { "agua",           light_agua },
+    { "electricidad",   light_electricidad },
+    { "fuego",          light_fuego },
+    { "humano",         light_humano },
+    { "metal",          light_metal },  
+    { "mono",           light_mono },
+    { "naturaleza",     light_naturaleza },
+    { "oeste",          light_oeste },
+    { "pajaro",         light_pajaro },
+    { "piedra",         light_piedra },
+    { "pistola",        light_pistola },
+    { "reggaeton",      light_reggaeton },
+    { "robot",          light_robot },
+    { "rock",           light_rock },
+    { "tormenta",       light_tormenta },
+    { "viento",         light_viento },
 };
 
 static const size_t element_count =
