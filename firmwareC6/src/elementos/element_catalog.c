@@ -16,47 +16,47 @@ static const char *TAG = "ELEMENT";
 
 static void light_agua(void)
 {
-    led_manager_set_solid(LED_COLOR_BLUE);
+    led_manager_set_water();
 }
 
 static void light_electricidad(void)
 {
-    led_manager_set_storm();
+    led_manager_set_electricity();
 }
 
 static void light_fuego(void)
 {
-    led_manager_set_solid(LED_COLOR_RED);
+    led_manager_set_fire();
 }
 
 static void light_humano(void)
 {
-    led_manager_set_solid(LED_COLOR_WHITE);
+    led_manager_set_rainbow();
 }
 
 static void light_metal(void)
 {
-    led_manager_set_solid(LED_COLOR_CYAN);
+    led_manager_set_diagonal_dual(LED_COLOR_WHITE, LED_COLOR_CYAN);
 }
 
 static void light_mono(void)
 {
-    led_manager_set_solid(LED_COLOR_YELLOW);
+    led_manager_set_diagonal_dual(LED_COLOR_DARK_BROWN, LED_COLOR_ORANGE);
 }
 
 static void light_naturaleza(void)
 {
-    led_manager_set_solid(LED_COLOR_GREEN);
+    led_manager_set_diagonal_dual(LED_COLOR_GREEN, LED_COLOR_CYAN);
 }
 
 static void light_oeste(void)
 {
-    led_manager_set_solid(LED_COLOR_YELLOW);
+    led_manager_set_diagonal_dual(LED_COLOR_ORANGE, LED_COLOR_LIGHT_BROWN);
 }
 
 static void light_pajaro(void)
 {
-    led_manager_set_solid(LED_COLOR_CYAN);
+    led_manager_set_diagonal_dual(LED_COLOR_BROWN, LED_COLOR_WHITE);
 }
 
 static void light_piedra(void)
@@ -66,22 +66,22 @@ static void light_piedra(void)
 
 static void light_pistola(void)
 {
-    led_manager_set_solid(LED_COLOR_RED);
+    led_manager_set_diagonal_dual(LED_COLOR_BLUE, LED_COLOR_WHITE);
 }
 
 static void light_reggaeton(void)
 {
-    led_manager_set_storm();
+    led_manager_set_diagonal_dual(LED_COLOR_WARM_WHITE, LED_COLOR_WHITE);
 }
 
 static void light_robot(void)
 {
-    led_manager_set_solid(LED_COLOR_CYAN);
+    led_manager_set_diagonal_dual(LED_COLOR_WHITE, LED_COLOR_RED);
 }
 
 static void light_rock(void)
 {
-    led_manager_set_solid(LED_COLOR_RED);
+    led_manager_set_diagonal_dual(LED_COLOR_RED, LED_COLOR_DARK_BROWN);
 }
 
 static void light_tormenta(void)
@@ -91,8 +91,9 @@ static void light_tormenta(void)
 
 static void light_viento(void)
 {
-    led_manager_set_solid(LED_COLOR_CYAN);
+    led_manager_set_diagonal_dual(LED_COLOR_CYAN, LED_COLOR_LIGHT_BLUE);
 }
+
 
 // -----------------------------------------------------------------------------
 // CATÁLOGO DE ELEMENTOS

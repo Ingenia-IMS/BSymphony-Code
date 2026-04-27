@@ -35,8 +35,8 @@
 
 // Coger / mover suave -> sonido
 #define PICKUP_COOLDOWN_MS          5000
-#define PICKUP_GYRO_MIN             8000
-#define PICKUP_ACCEL_DELTA_MIN      45000000
+#define PICKUP_GYRO_MIN             10000
+#define PICKUP_ACCEL_DELTA_MIN      85000000
 #define PICKUP_REQUIRED_COUNT       3
 
 // Agitar vigorosamente -> parpadeo
@@ -44,10 +44,10 @@
 #define SHAKE_GYRO_MIN              70000
 #define SHAKE_ACCEL_DELTA_MIN       250000000
 */
-#define SHAKE_GYRO_MIN              65000
-#define SHAKE_ACCEL_DELTA_MIN       230000000
+#define SHAKE_GYRO_MIN              60000
+#define SHAKE_ACCEL_DELTA_MIN       210000000
 
-#define SHAKE_REQUIRED_PEAKS        5
+#define SHAKE_REQUIRED_PEAKS        3
 #define SHAKE_WINDOW_MS             900
 #define SHAKE_MIN_PEAK_GAP_MS       80
 

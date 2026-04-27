@@ -121,6 +121,9 @@ static rgb_t color_from_enum(led_color_t color)
         case LED_COLOR_PINK:       return rgb_make(255,  40, 120);
         case LED_COLOR_PURPLE:     return rgb_make(140,   0, 180);
         case LED_COLOR_DARK_BLUE:  return rgb_make(  0,  20,  70);
+        case LED_COLOR_BROWN:        return rgb_make(139, 69, 19);   // marrón estándar (cuero)
+        case LED_COLOR_DARK_BROWN:   return rgb_make(101, 67, 33);   // marrón oscuro (madera/piedra)
+        case LED_COLOR_LIGHT_BROWN:  return rgb_make(181, 101, 29);  // marrón claro (arena)
         case LED_COLOR_OFF:
         default:                   return rgb_make(  0,   0,   0);
     }

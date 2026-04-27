@@ -4,9 +4,6 @@
 #include <stdint.h>
 #include "esp_err.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
 
 typedef enum {
     LED_COLOR_OFF = 0,
@@ -22,6 +19,9 @@ typedef enum {
     LED_COLOR_PINK,
     LED_COLOR_PURPLE,
     LED_COLOR_DARK_BLUE,
+    LED_COLOR_BROWN,
+    LED_COLOR_DARK_BROWN,
+    LED_COLOR_LIGHT_BROWN,
 } led_color_t;
 
 esp_err_t led_manager_init(void);
@@ -41,6 +41,3 @@ esp_err_t led_manager_set_water(void);
 esp_err_t led_manager_set_rainbow(void);
 esp_err_t led_manager_set_electricity(void);
 
-#ifdef __cplusplus
-}
-#endif
