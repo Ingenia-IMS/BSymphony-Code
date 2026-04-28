@@ -4,8 +4,8 @@
 #include "driver/i2s.h"
 #include "driver/i2s_pdm.h"
 
-#define SPK_OUT_PIN    D3
-#define SPK_ENA_PIN    D9   
+#define SPK_OUT_PIN    D1 //Voronoise D3
+#define SPK_ENA_PIN    D2 //Voronoise D9
 #define PDM_DOUT_PIN   SPK_OUT_PIN
 #define PDM_CLK_PIN    GPIO_NUM_NC  // D6
 #define SAMPLE_RATE    48000

@@ -5,21 +5,40 @@
 #include "freertos/task.h"
 
 #include "esp_log.h"
+#include "esp_err.h"
 
 #include <stdint.h>
 #include <stdbool.h>
 
 // -----------------------------------------------------------------------------
-// CONFIG I2C / MPU
+// CONFIG I2C / LSM6DSO32
 // -----------------------------------------------------------------------------
 
 #define I2C_PORT        I2C_NUM_0
-#define SDA_GPIO        22
-#define SCL_GPIO        23
-#define MPU_ADDR        0x68
+#define SDA_GPIO        GPIO_NUM_22
+#define SCL_GPIO        GPIO_NUM_23
 
-#define REG_PWR_MGMT_1  0x6B
-#define REG_ACCEL_XOUT  0x3B
+#define IMU_ADDR        0x6B
+
+#define REG_WHO_AM_I    0x0F
+#define WHO_AM_I_VALUE  0x6C
+
+#define REG_CTRL1_XL    0x10
+#define REG_CTRL2_G     0x11
+#define REG_CTRL3_C     0x12
+
+#define REG_OUTX_L_G    0x22
+#define REG_OUTX_L_A    0x28
+
+// CTRL3_C
+#define CTRL3_C_BDU     0x40
+#define CTRL3_C_IF_INC  0x04
+
+// Config elegida:
+// Acelerómetro: 104 Hz, ±8 g
+// Giroscopio:   104 Hz, ±500 dps
+#define CTRL1_XL_104HZ_8G       0x48
+#define CTRL2_G_104HZ_500DPS    0x44
 
 // -----------------------------------------------------------------------------
 // TASK
@@ -33,19 +52,14 @@
 // DETECCIÓN
 // -----------------------------------------------------------------------------
 
-// Coger / mover suave -> sonido
 #define PICKUP_COOLDOWN_MS          5000
-#define PICKUP_GYRO_MIN             10000
-#define PICKUP_ACCEL_DELTA_MIN      85000000
+
+#define PICKUP_GYRO_MIN             5000
+#define PICKUP_ACCEL_DELTA_MIN      6000000LL
 #define PICKUP_REQUIRED_COUNT       3
 
-// Agitar vigorosamente -> parpadeo
-/* Estos valores iban bien, un poco duro pero correcto
-#define SHAKE_GYRO_MIN              70000
-#define SHAKE_ACCEL_DELTA_MIN       250000000
-*/
-#define SHAKE_GYRO_MIN              60000
-#define SHAKE_ACCEL_DELTA_MIN       210000000
+#define SHAKE_GYRO_MIN              30000
+#define SHAKE_ACCEL_DELTA_MIN       16000000LL
 
 #define SHAKE_REQUIRED_PEAKS        3
 #define SHAKE_WINDOW_MS             900
@@ -57,8 +71,8 @@ static const char *TAG = "IMU";
 // VARIABLES INTERNAS
 // -----------------------------------------------------------------------------
 
-static i2c_master_bus_handle_t bus;
-static i2c_master_dev_handle_t dev;
+static i2c_master_bus_handle_t bus = NULL;
+static i2c_master_dev_handle_t dev = NULL;
 
 static TaskHandle_t imu_task_handle = NULL;
 
@@ -68,9 +82,9 @@ static imu_event_callback_t shake_callback = NULL;
 static int16_t ax, ay, az;
 static int16_t gx, gy, gz;
 
-static int32_t accel_norm = 0;
-static int32_t prev_accel_norm = 0;
-static int32_t accel_delta = 0;
+static int64_t accel_norm = 0;
+static int64_t prev_accel_norm = 0;
+static int64_t accel_delta = 0;
 static int32_t gyro_activity = 0;
 
 static bool first_sample = true;
@@ -86,12 +100,17 @@ static int shake_peak_count = 0;
 // UTILS
 // -----------------------------------------------------------------------------
 
+static int64_t iabs64(int64_t x)
+{
+    return (x < 0) ? -x : x;
+}
+
 static int32_t iabs32(int32_t x)
 {
     return (x < 0) ? -x : x;
 }
 
-static int16_t to_i16(uint8_t h, uint8_t l)
+static int16_t to_i16_le(uint8_t l, uint8_t h)
 {
     return (int16_t)((h << 8) | l);
 }
@@ -102,7 +121,7 @@ static uint32_t now_ms(void)
 }
 
 // -----------------------------------------------------------------------------
-// I2C / MPU
+// I2C / LSM6DSO32
 // -----------------------------------------------------------------------------
 
 static void i2c_init_internal(void)
@@ -112,29 +131,42 @@ static void i2c_init_internal(void)
         .sda_io_num = SDA_GPIO,
         .scl_io_num = SCL_GPIO,
         .clk_source = I2C_CLK_SRC_DEFAULT,
-        .flags.enable_internal_pullup = true
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
 
-    i2c_new_master_bus(&cfg, &bus);
+    ESP_ERROR_CHECK(i2c_new_master_bus(&cfg, &bus));
 
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = MPU_ADDR,
-        .scl_speed_hz = 400000
+        .device_address = IMU_ADDR,
+        .scl_speed_hz = 400000,
     };
 
-    i2c_master_bus_add_device(bus, &dev_cfg, &dev);
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &dev_cfg, &dev));
 }
 
-static void mpu_write(uint8_t reg, uint8_t val)
+static esp_err_t imu_write(uint8_t reg, uint8_t val)
 {
-    uint8_t data[2] = {reg, val};
-    i2c_master_transmit(dev, data, 2, -1);
+    uint8_t data[2] = { reg, val };
+    return i2c_master_transmit(dev, data, sizeof(data), pdMS_TO_TICKS(100));
 }
 
-static void mpu_read(uint8_t reg, uint8_t *data, int len)
+static esp_err_t imu_read(uint8_t reg, uint8_t *data, int len)
 {
-    i2c_master_transmit_receive(dev, &reg, 1, data, len, -1);
+    return i2c_master_transmit_receive(
+        dev,
+        &reg,
+        1,
+        data,
+        len,
+        pdMS_TO_TICKS(100)
+    );
+}
+
+static bool imu_read_u8(uint8_t reg, uint8_t *val)
+{
+    return imu_read(reg, val, 1) == ESP_OK;
 }
 
 // -----------------------------------------------------------------------------
@@ -145,10 +177,27 @@ void imu_init(void)
 {
     i2c_init_internal();
 
-    mpu_write(REG_PWR_MGMT_1, 0x00);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    uint8_t who = 0;
+    if (!imu_read_u8(REG_WHO_AM_I, &who)) {
+        ESP_LOGE(TAG, "No se pudo leer WHO_AM_I");
+        return;
+    }
+
+    ESP_LOGI(TAG, "WHO_AM_I = 0x%02X", who);
+
+    if (who != WHO_AM_I_VALUE) {
+        ESP_LOGW(TAG, "WHO_AM_I inesperado. Esperado 0x%02X", WHO_AM_I_VALUE);
+    }
+
+    ESP_ERROR_CHECK(imu_write(REG_CTRL3_C, CTRL3_C_BDU | CTRL3_C_IF_INC));
+    ESP_ERROR_CHECK(imu_write(REG_CTRL1_XL, CTRL1_XL_104HZ_8G));
+    ESP_ERROR_CHECK(imu_write(REG_CTRL2_G, CTRL2_G_104HZ_500DPS));
+
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    ESP_LOGI(TAG, "IMU inicializada");
+    ESP_LOGI(TAG, "LSM6DSO32 inicializada");
 }
 
 void imu_set_pickup_callback(imu_event_callback_t cb)
@@ -165,27 +214,37 @@ void imu_set_shake_callback(imu_event_callback_t cb)
 // LECTURA + DETECCIÓN
 // -----------------------------------------------------------------------------
 
-static void imu_read_sample(void)
+static bool imu_read_sample(void)
 {
-    uint8_t raw[14];
-    mpu_read(REG_ACCEL_XOUT, raw, 14);
+    uint8_t raw_g[6];
+    uint8_t raw_a[6];
 
-    ax = to_i16(raw[0], raw[1]);
-    ay = to_i16(raw[2], raw[3]);
-    az = to_i16(raw[4], raw[5]);
+    if (imu_read(REG_OUTX_L_G, raw_g, 6) != ESP_OK) {
+        ESP_LOGW(TAG, "Error leyendo gyro");
+        return false;
+    }
 
-    gx = to_i16(raw[8], raw[9]);
-    gy = to_i16(raw[10], raw[11]);
-    gz = to_i16(raw[12], raw[13]);
+    if (imu_read(REG_OUTX_L_A, raw_a, 6) != ESP_OK) {
+        ESP_LOGW(TAG, "Error leyendo accel");
+        return false;
+    }
+
+    gx = to_i16_le(raw_g[0], raw_g[1]);
+    gy = to_i16_le(raw_g[2], raw_g[3]);
+    gz = to_i16_le(raw_g[4], raw_g[5]);
+
+    ax = to_i16_le(raw_a[0], raw_a[1]);
+    ay = to_i16_le(raw_a[2], raw_a[3]);
+    az = to_i16_le(raw_a[4], raw_a[5]);
 
     prev_accel_norm = accel_norm;
 
     accel_norm =
-        (int32_t)ax * ax +
-        (int32_t)ay * ay +
-        (int32_t)az * az;
+        (int64_t)ax * ax +
+        (int64_t)ay * ay +
+        (int64_t)az * az;
 
-    accel_delta = iabs32(accel_norm - prev_accel_norm);
+    accel_delta = iabs64(accel_norm - prev_accel_norm);
     gyro_activity = iabs32(gx) + iabs32(gy) + iabs32(gz);
 
     if (first_sample) {
@@ -193,6 +252,8 @@ static void imu_read_sample(void)
         prev_accel_norm = accel_norm;
         accel_delta = 0;
     }
+
+    return true;
 }
 
 static void detect_pickup(uint32_t now, bool strong_shake_sample)
@@ -215,9 +276,9 @@ static void detect_pickup(uint32_t now, bool strong_shake_sample)
 
         ESP_LOGI(
             TAG,
-            "DETECTADO COGER/MOVER SUAVE -> sonido | gyro=%ld accel_delta=%ld",
+            "DETECTADO COGER/MOVER -> sonido | gyro=%ld accel_delta=%lld",
             (long)gyro_activity,
-            (long)accel_delta
+            (long long)accel_delta
         );
 
         last_pickup_ms = now;
@@ -260,9 +321,9 @@ static void detect_shake(uint32_t now, bool strong_shake_sample)
     if (shake_peak_count >= SHAKE_REQUIRED_PEAKS) {
         ESP_LOGI(
             TAG,
-            "DETECTADO AGITADO VIGOROSO -> parpadeo | gyro=%ld accel_delta=%ld peaks=%d",
+            "DETECTADO AGITADO VIGOROSO -> parpadeo | gyro=%ld accel_delta=%lld peaks=%d",
             (long)gyro_activity,
-            (long)accel_delta,
+            (long long)accel_delta,
             shake_peak_count
         );
 
@@ -287,16 +348,16 @@ static void imu_task(void *arg)
     ESP_LOGI(TAG, "Task IMU arrancada");
 
     while (1) {
-        imu_read_sample();
+        if (imu_read_sample()) {
+            uint32_t now = now_ms();
 
-        uint32_t now = now_ms();
+            bool strong_shake_sample =
+                gyro_activity > SHAKE_GYRO_MIN &&
+                accel_delta > SHAKE_ACCEL_DELTA_MIN;
 
-        bool strong_shake_sample =
-            gyro_activity > SHAKE_GYRO_MIN &&
-            accel_delta > SHAKE_ACCEL_DELTA_MIN;
-
-        detect_shake(now, strong_shake_sample);
-        detect_pickup(now, strong_shake_sample);
+            detect_shake(now, strong_shake_sample);
+            detect_pickup(now, strong_shake_sample);
+        }
 
         vTaskDelay(pdMS_TO_TICKS(IMU_PERIOD_MS));
     }

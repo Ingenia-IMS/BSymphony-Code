@@ -1,600 +1,177 @@
 #include "leds/led_manager.h"
 
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
+#include "driver/rmt_tx.h"
+#include "esp_log.h"
+#include "esp_err.h"
 
-#include "esp_random.h"
-#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "led_strip.h"
-#include "driver/rmt_tx.h"
 
-#define LED_GPIO                  GPIO_NUM_18
-#define LED_PHYSICAL_COUNT        8
-#define LED_ACTIVE_COUNT          4
-#define LED_TASK_STACK_WORDS      3072
-#define LED_TASK_PRIORITY         1
-#define LED_TASK_PERIOD_MS        25
+#include <string.h>
 
-#define LED_RMT_RESOLUTION_HZ     (10 * 1000 * 1000)
+#define TAG "LED"
 
-/* Parpadeo independiente: 2 ciclos por segundo -> periodo total 500 ms */
-#define BLINK_HALF_PERIOD_MS      125
+// -----------------------------------------------------------------------------
+// CONFIG
+// -----------------------------------------------------------------------------
 
-/* Si el orden físico no coincide con el cuadrado que imaginas,
-   cambia estos índices. Supuesto actual:
-   0 = arriba izquierda
-   1 = arriba derecha
-   2 = abajo izquierda
-   3 = abajo derecha
-*/
-static const uint8_t LOGICAL_TO_PHYSICAL[LED_ACTIVE_COUNT] = {0, 1, 2, 3};
+#define LED_GPIO   GPIO_NUM_16
+#define LED_COUNT  4
 
-typedef struct {
-    uint8_t r;
-    uint8_t g;
-    uint8_t b;
-} rgb_t;
+static rmt_channel_handle_t chan = NULL;
+static rmt_encoder_handle_t encoder = NULL;
 
-typedef enum {
-    EFFECT_OFF = 0,
-    EFFECT_SOLID,
-    EFFECT_DIAGONAL_DUAL,
-    EFFECT_STORM,
-    EFFECT_FIRE,
-    EFFECT_WATER,
-    EFFECT_RAINBOW,
-    EFFECT_ELECTRICITY,
-} led_effect_t;
+static uint8_t buffer[LED_COUNT * 3];
 
-typedef struct {
-    bool initialized;
-    led_strip_handle_t strip;
-    TaskHandle_t task_handle;
-    portMUX_TYPE lock;
+// blink
+static bool blink_enabled = false;
+static bool blink_state = true;
 
-    uint8_t master_brightness;
-    bool blink_enabled;
+// -----------------------------------------------------------------------------
+// LOW LEVEL
+// -----------------------------------------------------------------------------
 
-    led_effect_t effect;
-    rgb_t primary;
-    rgb_t secondary;
-
-    uint32_t effect_start_ms;
-
-    /* Para efectos con eventos */
-    uint32_t next_event_ms;
-    uint32_t event_end_ms;
-    uint32_t extra_event_ms;
-    uint8_t event_mask;
-
-    /* Frame cache para efectos aleatorios */
-    rgb_t cached_frame[LED_ACTIVE_COUNT];
-} led_state_t;
-
-static led_state_t s_led = {
-    .initialized = false,
-    .strip = NULL,
-    .task_handle = NULL,
-    .lock = portMUX_INITIALIZER_UNLOCKED,
-    .master_brightness = 180,
-    .blink_enabled = false,
-    .effect = EFFECT_OFF,
-    .primary = {0, 0, 0},
-    .secondary = {0, 0, 0},
-    .effect_start_ms = 0,
-    .next_event_ms = 0,
-    .event_end_ms = 0,
-    .extra_event_ms = 0,
-    .event_mask = 0,
-};
-
-/* =========================
- * Helpers básicos
- * ========================= */
-
-static uint32_t now_ms(void)
+static void set_raw(int i, uint8_t r, uint8_t g, uint8_t b)
 {
-    return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    if (i < 0 || i >= LED_COUNT) return;
+
+    buffer[i * 3 + 0] = g;
+    buffer[i * 3 + 1] = r;
+    buffer[i * 3 + 2] = b;
 }
 
-static rgb_t rgb_make(uint8_t r, uint8_t g, uint8_t b)
+// -----------------------------------------------------------------------------
+// INIT
+// -----------------------------------------------------------------------------
+
+void led_manager_init(void)
 {
-    rgb_t c = {.r = r, .g = g, .b = b};
-    return c;
-}
-
-static rgb_t color_from_enum(led_color_t color)
-{
-    switch (color) {
-        case LED_COLOR_RED:        return rgb_make(255,   0,   0);
-        case LED_COLOR_GREEN:      return rgb_make(  0, 255,   0);
-        case LED_COLOR_BLUE:       return rgb_make(  0,   0, 255);
-        case LED_COLOR_LIGHT_BLUE: return rgb_make( 80, 180, 255);
-        case LED_COLOR_CYAN:       return rgb_make(  0, 255, 255);
-        case LED_COLOR_WHITE:      return rgb_make(255, 255, 255);
-        case LED_COLOR_WARM_WHITE: return rgb_make(255, 180, 100);
-        case LED_COLOR_YELLOW:     return rgb_make(255, 220,   0);
-        case LED_COLOR_ORANGE:     return rgb_make(255, 120,   0);
-        case LED_COLOR_PINK:       return rgb_make(255,  40, 120);
-        case LED_COLOR_PURPLE:     return rgb_make(140,   0, 180);
-        case LED_COLOR_DARK_BLUE:  return rgb_make(  0,  20,  70);
-        case LED_COLOR_BROWN:        return rgb_make(139, 69, 19);   // marrón estándar (cuero)
-        case LED_COLOR_DARK_BROWN:   return rgb_make(101, 67, 33);   // marrón oscuro (madera/piedra)
-        case LED_COLOR_LIGHT_BROWN:  return rgb_make(181, 101, 29);  // marrón claro (arena)
-        case LED_COLOR_OFF:
-        default:                   return rgb_make(  0,   0,   0);
-    }
-}
-
-static uint8_t scale_u8(uint8_t value, uint8_t brightness)
-{
-    return (uint8_t)(((uint16_t)value * (uint16_t)brightness) / 255U);
-}
-
-static rgb_t scale_rgb(rgb_t c, uint8_t brightness)
-{
-    return rgb_make(
-        scale_u8(c.r, brightness),
-        scale_u8(c.g, brightness),
-        scale_u8(c.b, brightness)
-    );
-}
-
-static uint8_t lerp_u8(uint8_t a, uint8_t b, uint8_t t)
-{
-    int16_t diff = (int16_t)b - (int16_t)a;
-    return (uint8_t)(a + ((diff * t) / 255));
-}
-
-static rgb_t lerp_rgb(rgb_t a, rgb_t b, uint8_t t)
-{
-    return rgb_make(
-        lerp_u8(a.r, b.r, t),
-        lerp_u8(a.g, b.g, t),
-        lerp_u8(a.b, b.b, t)
-    );
-}
-
-/* Onda triangular 0..255..0 */
-static uint8_t triwave8(uint32_t period_ms, uint32_t now, uint32_t phase_ms)
-{
-    if (period_ms < 2U) {
-        return 0;
-    }
-
-    uint32_t x = (now + phase_ms) % period_ms;
-    uint32_t half = period_ms / 2U;
-    if (half == 0U) {
-        return 0;
-    }
-
-    if (x < half) {
-        return (uint8_t)((x * 255U) / half);
-    }
-
-    return (uint8_t)(((period_ms - x) * 255U) / half);
-}
-
-static rgb_t wheel(uint8_t pos)
-{
-    /* Arco iris clásico 0..255 */
-    if (pos < 85) {
-        return rgb_make((uint8_t)(255 - pos * 3), (uint8_t)(pos * 3), 0);
-    }
-    if (pos < 170) {
-        pos = (uint8_t)(pos - 85);
-        return rgb_make(0, (uint8_t)(255 - pos * 3), (uint8_t)(pos * 3));
-    }
-    pos = (uint8_t)(pos - 170);
-    return rgb_make((uint8_t)(pos * 3), 0, (uint8_t)(255 - pos * 3));
-}
-
-static bool blink_visible(uint32_t now)
-{
-    if (!s_led.blink_enabled) {
-        return true;
-    }
-    return (((now / BLINK_HALF_PERIOD_MS) & 1U) == 0U);
-}
-
-static void clear_frame(rgb_t frame[LED_ACTIVE_COUNT])
-{
-    for (int i = 0; i < LED_ACTIVE_COUNT; i++) {
-        frame[i] = rgb_make(0, 0, 0);
-    }
-}
-
-static void write_frame_to_strip(const rgb_t frame[LED_ACTIVE_COUNT], bool visible)
-{
-    rgb_t c;
-    esp_err_t err;
-
-    for (int logical = 0; logical < LED_ACTIVE_COUNT; logical++) {
-        uint8_t physical = LOGICAL_TO_PHYSICAL[logical];
-        c = visible ? scale_rgb(frame[logical], s_led.master_brightness)
-                    : rgb_make(0, 0, 0);
-
-        err = led_strip_set_pixel(s_led.strip, physical, c.r, c.g, c.b);
-        (void)err;
-    }
-
-    for (int i = LED_ACTIVE_COUNT; i < LED_PHYSICAL_COUNT; i++) {
-        err = led_strip_set_pixel(s_led.strip, i, 0, 0, 0);
-        (void)err;
-    }
-
-    err = led_strip_refresh(s_led.strip);
-    (void)err;
-}
-
-/* =========================
- * Generadores de efectos
- * ========================= */
-
-static void effect_off(rgb_t frame[LED_ACTIVE_COUNT])
-{
-    clear_frame(frame);
-}
-
-static void effect_solid(rgb_t frame[LED_ACTIVE_COUNT])
-{
-    for (int i = 0; i < LED_ACTIVE_COUNT; i++) {
-        frame[i] = s_led.primary;
-    }
-}
-
-static void effect_diagonal_dual(rgb_t frame[LED_ACTIVE_COUNT], uint32_t now)
-{
-    /* Suave pero rápida */
-    uint8_t t = triwave8(700, now, s_led.effect_start_ms);
-    rgb_t diag_a = lerp_rgb(s_led.primary, s_led.secondary, t);
-    rgb_t diag_b = lerp_rgb(s_led.secondary, s_led.primary, t);
-
-    /* Matriz:
-       0 1
-       2 3
-       Diagonales: (0,3) y (1,2)
-    */
-    frame[0] = diag_a;
-    frame[1] = diag_b;
-    frame[2] = diag_b;
-    frame[3] = diag_a;
-}
-
-static void effect_storm(rgb_t frame[LED_ACTIVE_COUNT], uint32_t now)
-{
-    /* Fondo azul oscuro moviéndose */
-    rgb_t dark_a = rgb_make(0, 12, 45);
-    rgb_t dark_b = rgb_make(0, 35, 95);
-    rgb_t dark_c = rgb_make(10, 60, 120);
-
-    uint8_t t0 = triwave8(1800, now, 0);
-    uint8_t t1 = triwave8(2300, now, 450);
-    uint8_t t2 = triwave8(1600, now, 900);
-
-    frame[0] = lerp_rgb(dark_a, dark_b, t0);
-    frame[1] = lerp_rgb(dark_b, dark_c, t1);
-    frame[2] = lerp_rgb(dark_a, dark_c, t2);
-    frame[3] = lerp_rgb(dark_b, dark_a, t0);
-
-    /* Relámpagos ocasionales */
-    if (now >= s_led.next_event_ms && now > s_led.event_end_ms) {
-        s_led.event_end_ms = now + 50U + (esp_random() % 50U);
-        s_led.extra_event_ms = s_led.event_end_ms + 70U + (esp_random() % 80U); /* posible segundo flash */
-        s_led.next_event_ms = now + 1800U + (esp_random() % 2500U);
-    }
-
-    if ((now < s_led.event_end_ms) || (now >= s_led.extra_event_ms && now < (s_led.extra_event_ms + 40U))) {
-        for (int i = 0; i < LED_ACTIVE_COUNT; i++) {
-            frame[i] = rgb_make(255, 255, 240);
-        }
-    }
-}
-
-static void effect_fire(rgb_t frame[LED_ACTIVE_COUNT], uint32_t now)
-{
-    if (now >= s_led.next_event_ms) {
-        s_led.next_event_ms = now + 45U + (esp_random() % 45U);
-
-        for (int i = 0; i < LED_ACTIVE_COUNT; i++) {
-            uint32_t r = esp_random() % 100U;
-            if (r < 20U) {
-                s_led.cached_frame[i] = rgb_make(255, 210, 40);   /* amarillo */
-            } else if (r < 65U) {
-                s_led.cached_frame[i] = rgb_make(255, 110, 0);    /* naranja */
-            } else {
-                s_led.cached_frame[i] = rgb_make(180, 15, 0);     /* rojo */
-            }
-        }
-    }
-
-    for (int i = 0; i < LED_ACTIVE_COUNT; i++) {
-        frame[i] = s_led.cached_frame[i];
-    }
-}
-
-static void effect_water(rgb_t frame[LED_ACTIVE_COUNT], uint32_t now)
-{
-    rgb_t a = rgb_make(0, 40, 120);
-    rgb_t b = rgb_make(0, 110, 255);
-    rgb_t c = rgb_make(0, 180, 255);
-
-    frame[0] = lerp_rgb(a, b, triwave8(1400, now,   0));
-    frame[1] = lerp_rgb(b, c, triwave8(1700, now, 200));
-    frame[2] = lerp_rgb(a, c, triwave8(1500, now, 500));
-    frame[3] = lerp_rgb(b, a, triwave8(1600, now, 800));
-}
-
-static void effect_rainbow(rgb_t frame[LED_ACTIVE_COUNT], uint32_t now)
-{
-    uint8_t base = (uint8_t)((now / 12U) & 0xFFU);
-    frame[0] = wheel((uint8_t)(base +   0));
-    frame[1] = wheel((uint8_t)(base +  64));
-    frame[2] = wheel((uint8_t)(base + 128));
-    frame[3] = wheel((uint8_t)(base + 192));
-}
-
-static void effect_electricity(rgb_t frame[LED_ACTIVE_COUNT], uint32_t now)
-{
-    /* Base blanco frío suave */
-    rgb_t base = rgb_make(110, 110, 125);
-    for (int i = 0; i < LED_ACTIVE_COUNT; i++) {
-        frame[i] = base;
-    }
-
-    if (now >= s_led.next_event_ms && now > s_led.event_end_ms) {
-        s_led.event_end_ms = now + 40U + (esp_random() % 50U);
-        s_led.next_event_ms = now + 400U + (esp_random() % 900U);
-
-        uint32_t pick = esp_random() % 6U;
-        switch (pick) {
-            case 0: s_led.event_mask = 0x1; break;
-            case 1: s_led.event_mask = 0x2; break;
-            case 2: s_led.event_mask = 0x4; break;
-            case 3: s_led.event_mask = 0x8; break;
-            case 4: s_led.event_mask = 0x5; break; /* diagonal */
-            default:s_led.event_mask = 0xA; break; /* diagonal */
-        }
-    }
-
-    if (now < s_led.event_end_ms) {
-        for (int i = 0; i < LED_ACTIVE_COUNT; i++) {
-            if (s_led.event_mask & (1U << i)) {
-                frame[i] = rgb_make(255, 220, 40);  /* rayo amarillo */
-            }
-        }
-    }
-}
-
-static void build_base_frame(rgb_t frame[LED_ACTIVE_COUNT], uint32_t now)
-{
-    switch (s_led.effect) {
-        case EFFECT_OFF:
-            effect_off(frame);
-            break;
-        case EFFECT_SOLID:
-            effect_solid(frame);
-            break;
-        case EFFECT_DIAGONAL_DUAL:
-            effect_diagonal_dual(frame, now);
-            break;
-        case EFFECT_STORM:
-            effect_storm(frame, now);
-            break;
-        case EFFECT_FIRE:
-            effect_fire(frame, now);
-            break;
-        case EFFECT_WATER:
-            effect_water(frame, now);
-            break;
-        case EFFECT_RAINBOW:
-            effect_rainbow(frame, now);
-            break;
-        case EFFECT_ELECTRICITY:
-            effect_electricity(frame, now);
-            break;
-        default:
-            effect_off(frame);
-            break;
-    }
-}
-
-/* =========================
- * Task interna
- * ========================= */
-
-static void led_task(void *arg)
-{
-    (void)arg;
-    rgb_t frame[LED_ACTIVE_COUNT];
-
-    while (1) {
-        uint32_t now = now_ms();
-
-        taskENTER_CRITICAL(&s_led.lock);
-        build_base_frame(frame, now);
-        bool visible = blink_visible(now);
-        taskEXIT_CRITICAL(&s_led.lock);
-
-        write_frame_to_strip(frame, visible);
-
-        vTaskDelay(pdMS_TO_TICKS(LED_TASK_PERIOD_MS));
-    }
-}
-
-/* =========================
- * API pública
- * ========================= */
-
-esp_err_t led_manager_init(void)
-{
-    if (s_led.initialized) {
-        return ESP_OK;
-    }
-
-    led_strip_config_t strip_config = {
-        .strip_gpio_num = LED_GPIO,
-        .max_leds = LED_PHYSICAL_COUNT,
-        .led_model = LED_MODEL_WS2812,
-        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
-        .flags = {
-            .invert_out = false,
-        },
-    };
-
-    led_strip_rmt_config_t rmt_config = {
+    rmt_tx_channel_config_t cfg = {
         .clk_src = RMT_CLK_SRC_DEFAULT,
-        .resolution_hz = LED_RMT_RESOLUTION_HZ,
+        .gpio_num = LED_GPIO,
         .mem_block_symbols = 64,
-        .flags = {
-            .with_dma = false,
-        },
+        .resolution_hz = 10000000,
+        .trans_queue_depth = 4,
     };
 
-    esp_err_t err = led_strip_new_rmt_device(&strip_config, &rmt_config, &s_led.strip);
-    if (err != ESP_OK) {
-        return err;
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&cfg, &chan));
+
+    rmt_bytes_encoder_config_t enc_cfg = {
+        .bit0 = {
+            .level0 = 1, .duration0 = 4,
+            .level1 = 0, .duration1 = 8,
+        },
+        .bit1 = {
+            .level0 = 1, .duration0 = 8,
+            .level1 = 0, .duration1 = 4,
+        },
+        .flags.msb_first = 1,
+    };
+
+    ESP_ERROR_CHECK(rmt_new_bytes_encoder(&enc_cfg, &encoder));
+    ESP_ERROR_CHECK(rmt_enable(chan));
+
+    ESP_LOGI(TAG, "LED manager listo");
+}
+
+// -----------------------------------------------------------------------------
+// CORE
+// -----------------------------------------------------------------------------
+
+void led_manager_show(void)
+{
+    if (blink_enabled && !blink_state) {
+        memset(buffer, 0, sizeof(buffer));
     }
 
-    s_led.initialized = true;
-    s_led.effect = EFFECT_OFF;
-    s_led.master_brightness = 180;
-    s_led.blink_enabled = false;
-    s_led.primary = rgb_make(0, 0, 0);
-    s_led.secondary = rgb_make(0, 0, 0);
-    s_led.effect_start_ms = now_ms();
-    s_led.next_event_ms = s_led.effect_start_ms + 1000U;
-    s_led.event_end_ms = 0;
-    s_led.extra_event_ms = 0;
-    s_led.event_mask = 0;
+    rmt_transmit_config_t tx = {
+        .loop_count = 0,
+    };
 
-    BaseType_t ok = xTaskCreate(
-        led_task,
-        "led_task",
-        LED_TASK_STACK_WORDS,
-        NULL,
-        LED_TASK_PRIORITY,
-        &s_led.task_handle
-    );
+    ESP_ERROR_CHECK(rmt_transmit(chan, encoder, buffer, sizeof(buffer), &tx));
+    ESP_ERROR_CHECK(rmt_tx_wait_all_done(chan, portMAX_DELAY));
 
-    led_manager_set_master_brightness(100);
+    vTaskDelay(pdMS_TO_TICKS(1));
+}
 
-    if (ok != pdPASS) {
-        return ESP_FAIL;
+void led_manager_clear(void)
+{
+    memset(buffer, 0, sizeof(buffer));
+}
+
+void led_manager_set_pixel(int i, uint8_t r, uint8_t g, uint8_t b)
+{
+    set_raw(i, r, g, b);
+}
+
+void led_manager_set_solid(uint8_t r, uint8_t g, uint8_t b)
+{
+    for (int i = 0; i < LED_COUNT; i++) {
+        set_raw(i, r, g, b);
     }
-
-    return ESP_OK;
 }
 
-esp_err_t led_manager_set_master_brightness(uint8_t brightness)
+// -----------------------------------------------------------------------------
+// EFECTOS
+// -----------------------------------------------------------------------------
+
+void led_manager_set_diagonal_dual(uint8_t r1, uint8_t g1, uint8_t b1,
+                                   uint8_t r2, uint8_t g2, uint8_t b2)
 {
-    taskENTER_CRITICAL(&s_led.lock);
-    s_led.master_brightness = brightness;
-    taskEXIT_CRITICAL(&s_led.lock);
-    return ESP_OK;
+    // diagonal 1: 0 y 2
+    set_raw(0, r1, g1, b1);
+    set_raw(2, r1, g1, b1);
+
+    // diagonal 2: 1 y 3
+    set_raw(1, r2, g2, b2);
+    set_raw(3, r2, g2, b2);
 }
 
-esp_err_t led_manager_set_blink_enabled(bool enabled)
+void led_manager_set_rainbow(void)
 {
-    taskENTER_CRITICAL(&s_led.lock);
-    s_led.blink_enabled = enabled;
-    taskEXIT_CRITICAL(&s_led.lock);
-    return ESP_OK;
+    set_raw(0, 255, 0, 0);     // rojo
+    set_raw(1, 0, 255, 0);     // verde
+    set_raw(2, 0, 0, 255);     // azul
+    set_raw(3, 255, 255, 0);   // amarillo
 }
 
-bool led_manager_is_blink_enabled(void)
+void led_manager_set_fire(void)
 {
-    bool enabled;
-    taskENTER_CRITICAL(&s_led.lock);
-    enabled = s_led.blink_enabled;
-    taskEXIT_CRITICAL(&s_led.lock);
-    return enabled;
+    set_raw(0, 255, 80, 0);
+    set_raw(1, 255, 30, 0);
+    set_raw(2, 180, 0, 0);
+    set_raw(3, 255, 120, 0);
 }
 
-esp_err_t led_manager_set_off(void)
+void led_manager_set_water(void)
 {
-    taskENTER_CRITICAL(&s_led.lock);
-    s_led.effect = EFFECT_OFF;
-    s_led.effect_start_ms = now_ms();
-    taskEXIT_CRITICAL(&s_led.lock);
-    return ESP_OK;
+    set_raw(0, 0, 50, 255);
+    set_raw(1, 0, 100, 255);
+    set_raw(2, 0, 150, 255);
+    set_raw(3, 0, 80, 200);
 }
 
-esp_err_t led_manager_set_solid(led_color_t color)
+void led_manager_set_electricity(void)
 {
-    taskENTER_CRITICAL(&s_led.lock);
-    s_led.effect = EFFECT_SOLID;
-    s_led.primary = color_from_enum(color);
-    s_led.effect_start_ms = now_ms();
-    taskEXIT_CRITICAL(&s_led.lock);
-    return ESP_OK;
+    set_raw(0, 150, 150, 255);
+    set_raw(1, 50, 50, 255);
+    set_raw(2, 200, 200, 255);
+    set_raw(3, 100, 100, 255);
 }
 
-esp_err_t led_manager_set_diagonal_dual(led_color_t color_a, led_color_t color_b)
+void led_manager_set_storm(void)
 {
-    taskENTER_CRITICAL(&s_led.lock);
-    s_led.effect = EFFECT_DIAGONAL_DUAL;
-    s_led.primary = color_from_enum(color_a);
-    s_led.secondary = color_from_enum(color_b);
-    s_led.effect_start_ms = now_ms();
-    taskEXIT_CRITICAL(&s_led.lock);
-    return ESP_OK;
+    set_raw(0, 20, 20, 50);
+    set_raw(1, 10, 10, 30);
+    set_raw(2, 40, 40, 80);
+    set_raw(3, 5, 5, 20);
 }
 
-esp_err_t led_manager_set_storm(void)
-{
-    taskENTER_CRITICAL(&s_led.lock);
-    s_led.effect = EFFECT_STORM;
-    s_led.effect_start_ms = now_ms();
-    s_led.next_event_ms = s_led.effect_start_ms + 1200U;
-    s_led.event_end_ms = 0;
-    s_led.extra_event_ms = 0;
-    taskEXIT_CRITICAL(&s_led.lock);
-    return ESP_OK;
-}
+// -----------------------------------------------------------------------------
+// BLINK
+// -----------------------------------------------------------------------------
 
-esp_err_t led_manager_set_fire(void)
+void led_manager_set_blink_enabled(bool enabled)
 {
-    taskENTER_CRITICAL(&s_led.lock);
-    s_led.effect = EFFECT_FIRE;
-    s_led.effect_start_ms = now_ms();
-    s_led.next_event_ms = 0;
-    for (int i = 0; i < LED_ACTIVE_COUNT; i++) {
-        s_led.cached_frame[i] = rgb_make(255, 110, 0);
-    }
-    taskEXIT_CRITICAL(&s_led.lock);
-    return ESP_OK;
-}
-
-esp_err_t led_manager_set_water(void)
-{
-    taskENTER_CRITICAL(&s_led.lock);
-    s_led.effect = EFFECT_WATER;
-    s_led.effect_start_ms = now_ms();
-    taskEXIT_CRITICAL(&s_led.lock);
-    return ESP_OK;
-}
-
-esp_err_t led_manager_set_rainbow(void)
-{
-    taskENTER_CRITICAL(&s_led.lock);
-    s_led.effect = EFFECT_RAINBOW;
-    s_led.effect_start_ms = now_ms();
-    taskEXIT_CRITICAL(&s_led.lock);
-    return ESP_OK;
-}
-
-esp_err_t led_manager_set_electricity(void)
-{
-    taskENTER_CRITICAL(&s_led.lock);
-    s_led.effect = EFFECT_ELECTRICITY;
-    s_led.effect_start_ms = now_ms();
-    s_led.next_event_ms = s_led.effect_start_ms + 300U;
-    s_led.event_end_ms = 0;
-    s_led.event_mask = 0;
-    taskEXIT_CRITICAL(&s_led.lock);
-    return ESP_OK;
+    blink_enabled = enabled;
 }

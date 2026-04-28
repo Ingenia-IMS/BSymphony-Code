@@ -1,115 +1,163 @@
-#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "driver/gpio.h"
+#include "driver/rmt_tx.h"
+
 #include "esp_log.h"
+#include "esp_err.h"
 
-#include "imu/imu_manager.h"
-#include "leds/led_manager.h"
-#include "sonido/sound_player.h"
-#include "elementos/element_catalog.h"
-#include "elementos/cube_state.h"
+#define TAG "LED_TEST"
 
-#define MAIN_TASK_DELAY_MS 20
+#define LED_GPIO   GPIO_NUM_16   // D7
+#define LED_COUNT  4
 
-static const char *TAG = "MAIN";
+// Orden físico:
+// 0 = arriba izquierda
+// 1 = abajo izquierda
+// 2 = abajo derecha
+// 3 = arriba derecha
 
-static const char *element_sequence[] = {
-    "agua",      
-    "electricidad",
-    "fuego",     
-    "humano",    
-    "metal",     
-    "mono",      
-    "naturaleza",
-    "oeste",     
-    "pajaro",    
-    "piedra",    
-    "pistola",   
-    "reggaeton", 
-    "robot",     
-    "rock",      
-    "tormenta",  
-    "viento",    
-};
+static rmt_channel_handle_t led_chan = NULL;
+static rmt_encoder_handle_t led_encoder = NULL;
 
-static const size_t element_sequence_count =
-    sizeof(element_sequence) / sizeof(element_sequence[0]);
+// Buffer en formato GRB
+static uint8_t led_data[LED_COUNT * 3];
 
-static size_t current_sequence_index = 0;
-
-static void change_to_sequence_element(size_t index)
+static void leds_init(void)
 {
-    if (element_sequence_count == 0) {
-        ESP_LOGE(TAG, "La secuencia de elementos está vacía");
+    rmt_tx_channel_config_t tx_config = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .gpio_num = LED_GPIO,
+        .mem_block_symbols = 64,
+        .resolution_hz = 10000000, // 10 MHz -> 1 tick = 100 ns
+        .trans_queue_depth = 4,
+    };
+
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_config, &led_chan));
+
+    rmt_bytes_encoder_config_t encoder_config = {
+        // 0: high corto, low largo
+        .bit0 = {
+            .level0 = 1,
+            .duration0 = 3,  // 300 ns
+            .level1 = 0,
+            .duration1 = 9,  // 900 ns
+        },
+        // 1: high largo, low corto
+        .bit1 = {
+            .level0 = 1,
+            .duration0 = 9,  // 900 ns
+            .level1 = 0,
+            .duration1 = 3,  // 300 ns
+        },
+        .flags.msb_first = 1,
+    };
+
+    ESP_ERROR_CHECK(rmt_new_bytes_encoder(&encoder_config, &led_encoder));
+    ESP_ERROR_CHECK(rmt_enable(led_chan));
+
+    ESP_LOGI(TAG, "LEDs inicializados en GPIO %d", LED_GPIO);
+}
+
+static void leds_set_pixel(int index, uint8_t r, uint8_t g, uint8_t b)
+{
+    if (index < 0 || index >= LED_COUNT) {
         return;
     }
 
-    if (index >= element_sequence_count) {
-        index = 0;
-    }
-
-    const char *element_name = element_sequence[index];
-
-    ESP_LOGI(TAG, "Cambiando a elemento de la secuencia: %s", element_name);
-
-    if (cube_state_set_element_by_name(element_name)) {
-        cube_state_play_current_sound();
-        current_sequence_index = index;
-    } else {
-        ESP_LOGW(TAG, "El elemento '%s' no existe en el catálogo", element_name);
-    }
+    // Estos LEDs usan normalmente orden GRB, no RGB
+    led_data[index * 3 + 0] = g;
+    led_data[index * 3 + 1] = r;
+    led_data[index * 3 + 2] = b;
 }
 
-static void change_to_next_sequence_element(void)
+static void leds_clear(void)
 {
-    size_t next_index = current_sequence_index + 1;
-
-    if (next_index >= element_sequence_count) {
-        next_index = 0;
-    }
-
-    change_to_sequence_element(next_index);
+    memset(led_data, 0, sizeof(led_data));
 }
 
-static void on_pickup_detected(void)
+static void leds_show(void)
 {
-    ESP_LOGI(
-        TAG,
-        "Mover suave -> sonido del elemento actual: %s",
-        cube_state_get_current_name()
-    );
+    rmt_transmit_config_t transmit_config = {
+        .loop_count = 0,
+    };
 
-    cube_state_play_current_sound();
-}
+    ESP_ERROR_CHECK(rmt_transmit(
+        led_chan,
+        led_encoder,
+        led_data,
+        sizeof(led_data),
+        &transmit_config
+    ));
 
-static void on_strong_shake_detected(void)
-{
-    ESP_LOGI(TAG, "Agitado vigoroso -> siguiente elemento de la secuencia");
+    ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
 
-    change_to_next_sequence_element();
+    // Reset/latch >300 us
+    vTaskDelay(pdMS_TO_TICKS(1));
 }
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Inicializando sistema...");
-
-    imu_init();
-    led_manager_init();
-    sound_player_init();
-    cube_state_init();
-
-    imu_set_pickup_callback(on_pickup_detected);
-    imu_set_shake_callback(on_strong_shake_detected);
-
-    imu_start_task();
-
-    change_to_sequence_element(0);
-
-    ESP_LOGI(TAG, "Elemento actual: %s", cube_state_get_current_name());
+    leds_init();
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(MAIN_TASK_DELAY_MS));
+        ESP_LOGI(TAG, "Todos rojo");
+        leds_clear();
+        for (int i = 0; i < LED_COUNT; i++) {
+            leds_set_pixel(i, 80, 0, 0);
+        }
+        leds_show();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        ESP_LOGI(TAG, "Todos verde");
+        leds_clear();
+        for (int i = 0; i < LED_COUNT; i++) {
+            leds_set_pixel(i, 0, 80, 0);
+        }
+        leds_show();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        ESP_LOGI(TAG, "Todos azul");
+        leds_clear();
+        for (int i = 0; i < LED_COUNT; i++) {
+            leds_set_pixel(i, 0, 0, 80);
+        }
+        leds_show();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        ESP_LOGI(TAG, "Prueba posiciones");
+
+        // 0 arriba izquierda
+        leds_clear();
+        leds_set_pixel(0, 80, 0, 0);
+        leds_show();
+        vTaskDelay(pdMS_TO_TICKS(700));
+
+        // 1 abajo izquierda
+        leds_clear();
+        leds_set_pixel(1, 0, 80, 0);
+        leds_show();
+        vTaskDelay(pdMS_TO_TICKS(700));
+
+        // 2 abajo derecha
+        leds_clear();
+        leds_set_pixel(2, 0, 0, 80);
+        leds_show();
+        vTaskDelay(pdMS_TO_TICKS(700));
+
+        // 3 arriba derecha
+        leds_clear();
+        leds_set_pixel(3, 80, 80, 0);
+        leds_show();
+        vTaskDelay(pdMS_TO_TICKS(700));
+
+        ESP_LOGI(TAG, "Apagado");
+        leds_clear();
+        leds_show();
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
