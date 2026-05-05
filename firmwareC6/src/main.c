@@ -1,111 +1,234 @@
-#include <stdio.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "driver/gpio.h"
+#include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "leds/led_manager.h"
-
-#define IR_SEL0_GPIO    GPIO_NUM_19   // D8
-#define IR_SEL1_GPIO    GPIO_NUM_17   // D7
-#define IR_RX_GPIO      GPIO_NUM_18   // D10
-#define IR_TX_GPIO      GPIO_NUM_20   // D9
-
-#define IR_FACE         1
-
-// Cambiar a 1 si tu circuito da HIGH cuando recibe IR
-#define IR_RX_ACTIVE_LEVEL 0
+#include "imu/imu_manager.h"
+#include "sonido/sound_player.h"
+#include "elementos/cube_state.h"
+#include "IR/ir_link.h"
 
 #define LED_BRIGHTNESS_20_PERCENT 51
 
-static const char *TAG = "IR_TEST";
+static const char *TAG = "MAIN_IR_TEST";
 
-static void ir_select_face_1(void)
+static volatile bool s_shake_requested = false;
+static volatile bool s_pickup_requested = false;
+
+static bool s_ir_ready_visual = false;
+static ir_role_t s_visual_role = IR_ROLE_UNKNOWN;
+static uint64_t s_visual_sync_time_us = 0;
+static bool s_visual_last_on = false;
+
+static void on_imu_shake(void)
 {
-    gpio_set_level(IR_SEL0_GPIO, 1); // SEL0 = 1
-    gpio_set_level(IR_SEL1_GPIO, 0); // SEL1 = 0
+    s_shake_requested = true;
 }
 
-static void ir_gpio_init(void)
+static void on_imu_pickup(void)
 {
-    gpio_config_t out_conf = {
-        .pin_bit_mask =
-            (1ULL << IR_SEL0_GPIO) |
-            (1ULL << IR_SEL1_GPIO) |
-            (1ULL << IR_TX_GPIO),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&out_conf);
-
-    gpio_config_t in_conf = {
-        .pin_bit_mask = (1ULL << IR_RX_GPIO),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&in_conf);
-
-    gpio_set_level(IR_TX_GPIO, 0);
-    ir_select_face_1();
+    s_pickup_requested = true;
 }
 
-static void ir_tx_blink_task(void *arg)
+static void debug_led_searching(void)
 {
-    bool tx_on = false;
+    led_manager_set_blink_enabled(true);
+    led_manager_set_solid(LED_COLOR_YELLOW);
+}
 
-    while (1) {
-        tx_on = !tx_on;
-        gpio_set_level(IR_TX_GPIO, tx_on);
+static void debug_led_candidate(ir_face_t face)
+{
+    (void)face;
+    led_manager_set_blink_enabled(true);
+    led_manager_set_solid(LED_COLOR_ORANGE);
+}
 
-        // 2 Hz: 250 ms ON + 250 ms OFF
-        vTaskDelay(pdMS_TO_TICKS(250));
+static void debug_led_locked(ir_face_t face)
+{
+    led_manager_set_blink_enabled(false);
+
+    switch (face) {
+        case IR_FACE_0:
+            led_manager_set_solid(LED_COLOR_BLUE);
+            break;
+        case IR_FACE_1:
+            led_manager_set_solid(LED_COLOR_LIGHT_BLUE);
+            break;
+        case IR_FACE_2:
+            led_manager_set_solid(LED_COLOR_PURPLE);
+            break;
+        case IR_FACE_3:
+            led_manager_set_solid(LED_COLOR_PINK);
+            break;
+        default:
+            led_manager_set_solid(LED_COLOR_WHITE);
+            break;
     }
 }
 
-static void ir_rx_led_task(void *arg)
+static void debug_led_synced_start(ir_role_t role, uint64_t sync_time_us)
 {
-    bool last_detected = false;
+    led_manager_set_blink_enabled(false);
+    s_ir_ready_visual = true;
+    s_visual_role = role;
+    s_visual_sync_time_us = sync_time_us;
+    s_visual_last_on = false;
+}
 
-    led_manager_set_master_brightness(LED_BRIGHTNESS_20_PERCENT);
-    led_manager_set_off();
+static void debug_led_idle_from_current_element(void)
+{
+    s_ir_ready_visual = false;
+    led_manager_set_blink_enabled(false);
 
-    while (1) {
-        int rx_level = gpio_get_level(IR_RX_GPIO);
-        bool detected = (rx_level == IR_RX_ACTIVE_LEVEL);
+    const char *name = cube_state_get_current_name();
+    if (name != NULL) {
+        cube_state_set_element_by_name(name);
+    } else {
+        led_manager_set_off();
+    }
+}
 
-        if (detected != last_detected) {
-            if (detected) {
-                led_manager_set_solid(LED_COLOR_RED);
-                ESP_LOGI(TAG, "IR detectado en cara %d", IR_FACE);
-            } else {
-                led_manager_set_off();
-                ESP_LOGI(TAG, "IR no detectado");
-            }
+static void debug_led_error_red(void)
+{
+    s_ir_ready_visual = false;
+    led_manager_set_blink_enabled(false);
+    led_manager_set_solid(LED_COLOR_RED);
+}
 
-            last_detected = detected;
-        }
+static void debug_update_synced_led(void)
+{
+    if (!s_ir_ready_visual) {
+        return;
+    }
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+    uint64_t now = (uint64_t)esp_timer_get_time();
+    uint64_t dt = now - s_visual_sync_time_us;
+
+    /*
+     * Parpadeo sincronizado simple:
+     * 0-120 ms ON, 120-400 ms OFF, repite cada 400 ms.
+     * Leader verde, follower cian.
+     */
+    bool on = (dt % 400000ULL) < 120000ULL;
+
+    if (on == s_visual_last_on) {
+        return;
+    }
+
+    s_visual_last_on = on;
+
+    if (!on) {
+        led_manager_set_off();
+        return;
+    }
+
+    if (s_visual_role == IR_ROLE_LEADER) {
+        led_manager_set_solid(LED_COLOR_GREEN);
+    } else if (s_visual_role == IR_ROLE_FOLLOWER) {
+        led_manager_set_solid(LED_COLOR_CYAN);
+    } else {
+        led_manager_set_solid(LED_COLOR_WHITE);
+    }
+}
+
+static void handle_ir_event(const ir_event_t *ev)
+{
+    ESP_LOGI(TAG,
+             "IR event=%s state=%s face=%d role=%s",
+             ir_link_event_name(ev->type),
+             ir_link_state_name(ev->state),
+             ev->face,
+             ir_link_role_name(ev->role));
+
+    switch (ev->type) {
+        case IR_EVENT_SEARCH_STARTED:
+            debug_led_searching();
+            break;
+
+        case IR_EVENT_CANDIDATE_FACE:
+            debug_led_candidate(ev->face);
+            break;
+
+        case IR_EVENT_FACE_LOCKED:
+            debug_led_locked(ev->face);
+            break;
+
+        case IR_EVENT_SYNCED:
+            debug_led_synced_start(ev->role, ev->sync_time_us);
+            break;
+
+        case IR_EVENT_SEARCH_TIMEOUT:
+            ESP_LOGI(TAG, "IR timeout: no se encontró otro cubo en 5 s");
+            debug_led_error_red();
+            vTaskDelay(pdMS_TO_TICKS(300));
+            debug_led_idle_from_current_element();
+            break;
+
+        case IR_EVENT_LINK_LOST:
+            ESP_LOGI(TAG, "IR perdido: 3 s sin ver al otro cubo");
+            debug_led_error_red();
+            vTaskDelay(pdMS_TO_TICKS(300));
+            debug_led_idle_from_current_element();
+            break;
+
+        case IR_EVENT_STOPPED:
+            debug_led_idle_from_current_element();
+            break;
+
+        default:
+            break;
     }
 }
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Test IR simple en cara %d", IR_FACE);
-
-    ir_gpio_init();
+    ESP_LOGI(TAG, "Branch prueba IR robusto");
 
     ESP_ERROR_CHECK(led_manager_init());
     ESP_ERROR_CHECK(led_manager_set_master_brightness(LED_BRIGHTNESS_20_PERCENT));
+    ESP_ERROR_CHECK(led_manager_set_blink_enabled(false));
     ESP_ERROR_CHECK(led_manager_set_off());
 
-    xTaskCreate(ir_tx_blink_task, "ir_tx_blink", 2048, NULL, 5, NULL);
-    xTaskCreate(ir_rx_led_task, "ir_rx_led", 2048, NULL, 5, NULL);
+    sound_player_init();
+
+    cube_state_init();
+
+    imu_init();
+    imu_set_pickup_callback(on_imu_pickup);
+    imu_set_shake_callback(on_imu_shake);
+    imu_start_task();
+
+    ir_link_init();
+
+    ESP_LOGI(TAG, "Listo. Sacude dos cubos y júntalos por una cara.");
+
+    while (1) {
+        if (s_pickup_requested) {
+            s_pickup_requested = false;
+            ESP_LOGI(TAG, "Pickup detectado");
+        }
+
+        if (s_shake_requested) {
+            s_shake_requested = false;
+            ESP_LOGI(TAG, "Shake detectado: arrancando búsqueda IR");
+            ir_link_start_search();
+            debug_led_searching();
+        }
+
+        ir_event_t ev;
+        while (ir_link_get_event(&ev, 0)) {
+            handle_ir_event(&ev);
+        }
+
+        debug_update_synced_led();
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
