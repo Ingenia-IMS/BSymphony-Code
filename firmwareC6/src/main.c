@@ -1,115 +1,111 @@
-#include <stddef.h>
+#include <stdio.h>
+#include <stdbool.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "driver/gpio.h"
 #include "esp_log.h"
 
-#include "imu/imu_manager.h"
 #include "leds/led_manager.h"
-#include "sonido/sound_player.h"
-#include "elementos/element_catalog.h"
-#include "elementos/cube_state.h"
 
-#define MAIN_TASK_DELAY_MS 20
+#define IR_SEL0_GPIO    GPIO_NUM_19   // D8
+#define IR_SEL1_GPIO    GPIO_NUM_17   // D7
+#define IR_RX_GPIO      GPIO_NUM_18   // D10
+#define IR_TX_GPIO      GPIO_NUM_20   // D9
 
-static const char *TAG = "MAIN";
+#define IR_FACE         1
 
-static const char *element_sequence[] = {
-    "agua",      
-    "electricidad",
-    "fuego",     
-    "humano",    
-    "metal",     
-    "mono",      
-    "naturaleza",
-    "oeste",     
-    "pajaro",    
-    "piedra",    
-    "pistola",   
-    "reggaeton", 
-    "robot",     
-    "rock",      
-    "tormenta",  
-    "viento",    
-};
+// Cambiar a 1 si tu circuito da HIGH cuando recibe IR
+#define IR_RX_ACTIVE_LEVEL 0
 
-static const size_t element_sequence_count =
-    sizeof(element_sequence) / sizeof(element_sequence[0]);
+#define LED_BRIGHTNESS_20_PERCENT 51
 
-static size_t current_sequence_index = 0;
+static const char *TAG = "IR_TEST";
 
-static void change_to_sequence_element(size_t index)
+static void ir_select_face_1(void)
 {
-    if (element_sequence_count == 0) {
-        ESP_LOGE(TAG, "La secuencia de elementos está vacía");
-        return;
-    }
+    gpio_set_level(IR_SEL0_GPIO, 1); // SEL0 = 1
+    gpio_set_level(IR_SEL1_GPIO, 0); // SEL1 = 0
+}
 
-    if (index >= element_sequence_count) {
-        index = 0;
-    }
+static void ir_gpio_init(void)
+{
+    gpio_config_t out_conf = {
+        .pin_bit_mask =
+            (1ULL << IR_SEL0_GPIO) |
+            (1ULL << IR_SEL1_GPIO) |
+            (1ULL << IR_TX_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&out_conf);
 
-    const char *element_name = element_sequence[index];
+    gpio_config_t in_conf = {
+        .pin_bit_mask = (1ULL << IR_RX_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&in_conf);
 
-    ESP_LOGI(TAG, "Cambiando a elemento de la secuencia: %s", element_name);
+    gpio_set_level(IR_TX_GPIO, 0);
+    ir_select_face_1();
+}
 
-    if (cube_state_set_element_by_name(element_name)) {
-        cube_state_play_current_sound();
-        current_sequence_index = index;
-    } else {
-        ESP_LOGW(TAG, "El elemento '%s' no existe en el catálogo", element_name);
+static void ir_tx_blink_task(void *arg)
+{
+    bool tx_on = false;
+
+    while (1) {
+        tx_on = !tx_on;
+        gpio_set_level(IR_TX_GPIO, tx_on);
+
+        // 2 Hz: 250 ms ON + 250 ms OFF
+        vTaskDelay(pdMS_TO_TICKS(250));
     }
 }
 
-static void change_to_next_sequence_element(void)
+static void ir_rx_led_task(void *arg)
 {
-    size_t next_index = current_sequence_index + 1;
+    bool last_detected = false;
 
-    if (next_index >= element_sequence_count) {
-        next_index = 0;
+    led_manager_set_master_brightness(LED_BRIGHTNESS_20_PERCENT);
+    led_manager_set_off();
+
+    while (1) {
+        int rx_level = gpio_get_level(IR_RX_GPIO);
+        bool detected = (rx_level == IR_RX_ACTIVE_LEVEL);
+
+        if (detected != last_detected) {
+            if (detected) {
+                led_manager_set_solid(LED_COLOR_RED);
+                ESP_LOGI(TAG, "IR detectado en cara %d", IR_FACE);
+            } else {
+                led_manager_set_off();
+                ESP_LOGI(TAG, "IR no detectado");
+            }
+
+            last_detected = detected;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
-
-    change_to_sequence_element(next_index);
-}
-
-static void on_pickup_detected(void)
-{
-    ESP_LOGI(
-        TAG,
-        "Mover suave -> sonido del elemento actual: %s",
-        cube_state_get_current_name()
-    );
-
-    cube_state_play_current_sound();
-}
-
-static void on_strong_shake_detected(void)
-{
-    ESP_LOGI(TAG, "Agitado vigoroso -> siguiente elemento de la secuencia");
-
-    change_to_next_sequence_element();
 }
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Inicializando sistema...");
+    ESP_LOGI(TAG, "Test IR simple en cara %d", IR_FACE);
 
-    imu_init();
-    led_manager_init();
-    sound_player_init();
-    cube_state_init();
+    ir_gpio_init();
 
-    imu_set_pickup_callback(on_pickup_detected);
-    imu_set_shake_callback(on_strong_shake_detected);
+    ESP_ERROR_CHECK(led_manager_init());
+    ESP_ERROR_CHECK(led_manager_set_master_brightness(LED_BRIGHTNESS_20_PERCENT));
+    ESP_ERROR_CHECK(led_manager_set_off());
 
-    imu_start_task();
-
-    change_to_sequence_element(0);
-
-    ESP_LOGI(TAG, "Elemento actual: %s", cube_state_get_current_name());
-
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(MAIN_TASK_DELAY_MS));
-    }
+    xTaskCreate(ir_tx_blink_task, "ir_tx_blink", 2048, NULL, 5, NULL);
+    xTaskCreate(ir_rx_led_task, "ir_rx_led", 2048, NULL, 5, NULL);
 }
