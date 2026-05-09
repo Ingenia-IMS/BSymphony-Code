@@ -18,7 +18,7 @@
 #define SDA_GPIO        GPIO_NUM_22
 #define SCL_GPIO        GPIO_NUM_23
 
-#define IMU_ADDR        0x6B
+#define IMU_ADDR        0x6A
 
 #define REG_WHO_AM_I    0x0F
 #define WHO_AM_I_VALUE  0x6C

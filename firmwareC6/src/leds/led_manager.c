@@ -23,7 +23,7 @@
 
 #define LED_TASK_STACK_WORDS      3072
 #define LED_TASK_PRIORITY         1
-#define LED_TASK_PERIOD_MS        25
+#define LED_TASK_PERIOD_MS        100
 
 #define LED_RMT_RESOLUTION_HZ     10000000     // 10 MHz
 
@@ -234,9 +234,13 @@ static void write_frame_to_strip(const rgb_t frame[LED_ACTIVE_COUNT], bool visib
         &tx_config
     );
 
-    if (err == ESP_OK) {
-        (void)rmt_tx_wait_all_done(s_led.rmt_chan, pdMS_TO_TICKS(20));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "rmt_transmit failed: %s", esp_err_to_name(err));
+        return;
     }
+
+    // Durante pruebas, NO esperamos al RMT.
+    // Evitamos que el driver se quede soltando flush timeout en bucle.
 
     // Reset/latch >300 us
     vTaskDelay(pdMS_TO_TICKS(1));
@@ -462,7 +466,7 @@ esp_err_t led_manager_init(void)
         .gpio_num = LED_GPIO,
         .mem_block_symbols = 64,
         .resolution_hz = LED_RMT_RESOLUTION_HZ,
-        .trans_queue_depth = 4,
+        .trans_queue_depth = 1,
     };
 
     esp_err_t err = rmt_new_tx_channel(&tx_config, &s_led.rmt_chan);
