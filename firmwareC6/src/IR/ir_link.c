@@ -49,6 +49,7 @@ typedef struct {
 static QueueHandle_t s_cmd_q = NULL;
 static QueueHandle_t s_event_q = NULL;
 static SemaphoreHandle_t s_mutex = NULL;
+static TaskHandle_t s_task = NULL;
 static ir_ctx_t s_ctx;
 
 static void ir_task(void *arg);
@@ -64,11 +65,10 @@ static void delay_us(uint32_t us);
 static void enter_state(ir_ctx_t *ctx, ir_link_state_t state);
 static void publish_event(const ir_ctx_t *ctx, ir_event_type_t type);
 static void shuffle_order(ir_ctx_t *ctx);
-static uint32_t random_us(uint32_t max_us);
+static uint32_t random_percent(void);
 
 static void signal_send_beacon(uint8_t bursts);
 static bool signal_detect_activity(uint32_t window_us);
-static bool signal_send_beacon_and_detect(uint32_t slot_us);
 
 static void handle_search(ir_ctx_t *ctx);
 static void handle_confirm(ir_ctx_t *ctx);
@@ -96,7 +96,7 @@ void ir_link_init(void)
         IR_TASK_STACK_BYTES,
         NULL,
         IR_TASK_PRIORITY,
-        NULL,
+        &s_task,
         IR_TASK_CORE
     );
 
@@ -108,6 +108,15 @@ void ir_link_init(void)
 void ir_link_start_search(void)
 {
     if (s_cmd_q == NULL) return;
+
+    ir_status_t st;
+    if (ir_link_get_status(&st)) {
+        if (st.state != IR_LINK_IDLE) {
+            ESP_LOGI(TAG, "Ignoro start_search porque estado actual=%s", ir_link_state_name(st.state));
+            return;
+        }
+    }
+
     ir_cmd_t cmd = {.type = IR_CMD_START_SEARCH};
     xQueueSend(s_cmd_q, &cmd, 0);
 }
@@ -251,7 +260,7 @@ static void ir_task(void *arg)
             case IR_LINK_IDLE:
             case IR_LINK_LOCKED:
             default:
-                vTaskDelay(pdMS_TO_TICKS(20));
+                vTaskDelay(pdMS_TO_TICKS(25));
                 break;
         }
     }
@@ -287,7 +296,7 @@ static void hw_init(void)
     hw_tx_off();
     hw_select_face(IR_FACE_0);
 
-    ESP_LOGI(TAG, "init SEL0=%d SEL1=%d RX=%d TX=%d active_level=%d",
+    ESP_LOGI(TAG, "init SEL0=%d SEL1=%d RX=%d TX=%d active=%d",
              IR_SEL0_GPIO, IR_SEL1_GPIO, IR_RX_GPIO, IR_TX_GPIO, IR_RX_ACTIVE_LEVEL);
 }
 
@@ -347,6 +356,12 @@ static void signal_send_beacon(uint8_t bursts)
 
 static bool signal_detect_activity(uint32_t window_us)
 {
+    /*
+     * Ventana de recepción pura: NO se emite nada aquí.
+     * Esto es clave para evitar auto-detección.
+     */
+    hw_tx_off();
+
     uint64_t end = now_us() + window_us;
     uint64_t active_since = 0;
 
@@ -365,35 +380,6 @@ static bool signal_detect_activity(uint32_t window_us)
     }
 
     return false;
-}
-
-static bool signal_send_beacon_and_detect(uint32_t slot_us)
-{
-    uint64_t start = now_us();
-    bool hit = false;
-
-    if (signal_detect_activity(IR_PRE_LISTEN_US)) {
-        hit = true;
-    }
-
-    for (uint8_t i = 0; i < IR_BEACON_BURSTS; i++) {
-        hw_tx_on();
-        delay_us(IR_BEACON_BURST_US);
-        hw_tx_off();
-
-        if (signal_detect_activity(IR_BEACON_GAP_US)) {
-            hit = true;
-        }
-    }
-
-    uint64_t elapsed = now_us() - start;
-    if (elapsed < slot_us) {
-        if (signal_detect_activity((uint32_t)(slot_us - elapsed))) {
-            hit = true;
-        }
-    }
-
-    return hit;
 }
 
 // -----------------------------------------------------------------------------
@@ -427,10 +413,9 @@ static void publish_event(const ir_ctx_t *ctx, ir_event_type_t type)
     xQueueSend(s_event_q, &ev, 0);
 }
 
-static uint32_t random_us(uint32_t max_us)
+static uint32_t random_percent(void)
 {
-    if (max_us == 0) return 0;
-    return esp_random() % max_us;
+    return esp_random() % 100U;
 }
 
 static void shuffle_order(ir_ctx_t *ctx)
@@ -468,20 +453,32 @@ static void handle_search(ir_ctx_t *ctx)
     }
 
     ir_face_t face = (ir_face_t)ctx->order[ctx->order_index++];
-    uint32_t slot_us = IR_SEARCH_SLOT_BASE_US + random_us(IR_SEARCH_SLOT_JITTER_US);
-
     hw_select_face(face);
 
-    bool hit = signal_send_beacon_and_detect(slot_us);
-    if (hit) {
-        ctx->candidate_face = face;
-        ctx->confirm_hits = 0;
-        enter_state(ctx, IR_LINK_CONFIRMING_FACE);
-        publish_event(ctx, IR_EVENT_CANDIDATE_FACE);
-        return;
+    bool tx_slot = random_percent() < IR_SEARCH_TX_PROB_PERCENT;
+
+    if (tx_slot) {
+        /*
+         * Emito, pero NO cuento RX en este slot.
+         * Así no me bloqueo por mi propia emisión.
+         */
+        signal_send_beacon(IR_BEACON_BURSTS);
+    } else {
+        /*
+         * Escucha pura.
+         */
+        if (signal_detect_activity(IR_SEARCH_RX_WINDOW_US)) {
+            ctx->candidate_face = face;
+            ctx->confirm_hits = 1;
+            ctx->last_rx_us = now_us();
+            enter_state(ctx, IR_LINK_CONFIRMING_FACE);
+            publish_event(ctx, IR_EVENT_CANDIDATE_FACE);
+            vTaskDelay(pdMS_TO_TICKS(IR_CONFIRM_TICK_MS));
+            return;
+        }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(1));
+    vTaskDelay(pdMS_TO_TICKS(IR_SEARCH_TICK_MS));
 }
 
 static void handle_confirm(ir_ctx_t *ctx)
@@ -503,9 +500,15 @@ static void handle_confirm(ir_ctx_t *ctx)
 
     hw_select_face(ctx->candidate_face);
 
-    if (signal_send_beacon_and_detect(IR_CONFIRM_ATTEMPT_US)) {
-        ctx->confirm_hits++;
-        ctx->last_rx_us = now_us();
+    bool tx_slot = random_percent() < IR_CONFIRM_TX_PROB_PERCENT;
+
+    if (tx_slot) {
+        signal_send_beacon(IR_BEACON_BURSTS);
+    } else {
+        if (signal_detect_activity(IR_CONFIRM_RX_WINDOW_US)) {
+            ctx->confirm_hits++;
+            ctx->last_rx_us = now_us();
+        }
     }
 
     if (ctx->confirm_hits >= IR_CONFIRM_REQUIRED_HITS) {
@@ -517,49 +520,66 @@ static void handle_confirm(ir_ctx_t *ctx)
         enter_state(ctx, IR_LINK_LOCKED);
         publish_event(ctx, IR_EVENT_FACE_LOCKED);
 
-        ctx->claim_deadline_us = now_us() + IR_SYNC_CLAIM_MIN_US + random_us(IR_SYNC_CLAIM_RANDOM_US);
+        ctx->claim_deadline_us = now_us() + IR_SYNC_CLAIM_MIN_US + (esp_random() % IR_SYNC_CLAIM_RANDOM_US);
         enter_state(ctx, IR_LINK_SYNCING);
+        vTaskDelay(pdMS_TO_TICKS(IR_SYNC_TICK_MS));
         return;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(1));
+    vTaskDelay(pdMS_TO_TICKS(IR_CONFIRM_TICK_MS));
 }
 
 static void handle_syncing(ir_ctx_t *ctx)
 {
-    hw_select_face(ctx->locked_face);
-
-    if (signal_detect_activity(IR_READY_RX_WINDOW_US)) {
-        ctx->role = IR_ROLE_FOLLOWER;
-        ctx->last_rx_us = now_us();
-        ctx->sync_time_us = now_us();
-        enter_state(ctx, IR_LINK_READY);
-        publish_event(ctx, IR_EVENT_SYNCED);
-        return;
-    }
-
     uint64_t t = now_us();
 
-    if (t >= ctx->claim_deadline_us) {
-        ctx->role = IR_ROLE_LEADER;
-        ctx->sync_time_us = now_us();
-        signal_send_beacon(5);
-        ctx->last_rx_us = now_us();
-        ctx->last_sync_tx_us = now_us();
-        ctx->last_presence_tx_us = now_us();
-        enter_state(ctx, IR_LINK_READY);
-        publish_event(ctx, IR_EVENT_SYNCED);
+    if (t - ctx->state_since_us > IR_SYNC_TIMEOUT_US) {
+        ctx->locked_face = IR_FACE_NONE;
+        ctx->candidate_face = IR_FACE_NONE;
+        ctx->role = IR_ROLE_UNKNOWN;
+        enter_state(ctx, IR_LINK_IDLE);
+        publish_event(ctx, IR_EVENT_LINK_LOST);
         return;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(1));
+    hw_select_face(ctx->locked_face);
+
+    if (t < ctx->claim_deadline_us) {
+        if (signal_detect_activity(IR_SYNC_RX_WINDOW_US)) {
+            ctx->role = IR_ROLE_FOLLOWER;
+            ctx->last_rx_us = now_us();
+            ctx->sync_time_us = now_us();
+            enter_state(ctx, IR_LINK_READY);
+            publish_event(ctx, IR_EVENT_SYNCED);
+            vTaskDelay(pdMS_TO_TICKS(IR_READY_TICK_MS));
+            return;
+        }
+
+        if (random_percent() < IR_SYNC_TX_PROB_PERCENT) {
+            signal_send_beacon(IR_BEACON_BURSTS);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(IR_SYNC_TICK_MS));
+        return;
+    }
+
+    ctx->role = IR_ROLE_LEADER;
+    ctx->sync_time_us = now_us();
+    signal_send_beacon(5);
+    ctx->last_sync_tx_us = now_us();
+    ctx->last_presence_tx_us = now_us();
+    ctx->last_rx_us = now_us();
+
+    enter_state(ctx, IR_LINK_READY);
+    publish_event(ctx, IR_EVENT_SYNCED);
+    vTaskDelay(pdMS_TO_TICKS(IR_READY_TICK_MS));
 }
 
 static void handle_ready(ir_ctx_t *ctx)
 {
-    hw_select_face(ctx->locked_face);
-
     uint64_t t = now_us();
+
+    hw_select_face(ctx->locked_face);
 
     if (signal_detect_activity(IR_READY_RX_WINDOW_US)) {
         ctx->last_rx_us = now_us();
@@ -569,13 +589,14 @@ static void handle_ready(ir_ctx_t *ctx)
         }
     }
 
-    if (t - ctx->last_rx_us > IR_LOST_TIMEOUT_US) {
+    if (ctx->last_rx_us != 0 && (t - ctx->last_rx_us > IR_LOST_TIMEOUT_US)) {
         hw_tx_off();
         ctx->locked_face = IR_FACE_NONE;
         ctx->candidate_face = IR_FACE_NONE;
         ctx->role = IR_ROLE_UNKNOWN;
         enter_state(ctx, IR_LINK_IDLE);
         publish_event(ctx, IR_EVENT_LINK_LOST);
+        vTaskDelay(pdMS_TO_TICKS(IR_READY_TICK_MS));
         return;
     }
 
@@ -592,5 +613,5 @@ static void handle_ready(ir_ctx_t *ctx)
         }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(2));
+    vTaskDelay(pdMS_TO_TICKS(IR_READY_TICK_MS));
 }
