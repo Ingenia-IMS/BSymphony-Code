@@ -23,11 +23,15 @@
 
 #define LED_TASK_STACK_WORDS      3072
 #define LED_TASK_PRIORITY         1
-#define LED_TASK_PERIOD_MS        25
+#define LED_TASK_PERIOD_MS        100
 
 #define LED_RMT_RESOLUTION_HZ     10000000     // 10 MHz
 
 #define BLINK_HALF_PERIOD_MS      125
+
+// Si tras esto sigue dando problemas, prueba a poner 0 para desactivar logs
+// repetitivos de RMT.
+#define LED_LOG_RMT_ERRORS        1
 
 // Orden físico nuevo:
 // 0 = arriba izquierda
@@ -79,6 +83,9 @@ typedef struct {
     rgb_t cached_frame[LED_ACTIVE_COUNT];
 
     uint8_t tx_buffer[LED_PHYSICAL_COUNT * 3]; // GRB
+
+    bool rmt_busy;
+    uint32_t last_rmt_error_ms;
 } led_state_t;
 
 static const char *TAG = "LED";
@@ -92,6 +99,8 @@ static led_state_t s_led = {
     .master_brightness = 100,
     .blink_enabled = false,
     .effect = EFFECT_OFF,
+    .rmt_busy = false,
+    .last_rmt_error_ms = 0,
 };
 
 // -----------------------------------------------------------------------------
@@ -204,11 +213,40 @@ static void clear_frame(rgb_t frame[LED_ACTIVE_COUNT])
 }
 
 // -----------------------------------------------------------------------------
+// RMT CALLBACK
+// -----------------------------------------------------------------------------
+
+static bool IRAM_ATTR rmt_tx_done_callback(
+    rmt_channel_handle_t channel,
+    const rmt_tx_done_event_data_t *edata,
+    void *user_ctx
+)
+{
+    (void)channel;
+    (void)edata;
+
+    led_state_t *state = (led_state_t *)user_ctx;
+    state->rmt_busy = false;
+
+    return false;
+}
+
+// -----------------------------------------------------------------------------
 // RMT WRITE
 // -----------------------------------------------------------------------------
 
 static void write_frame_to_strip(const rgb_t frame[LED_ACTIVE_COUNT], bool visible)
 {
+    if (!s_led.initialized || s_led.rmt_chan == NULL || s_led.rmt_encoder == NULL) {
+        return;
+    }
+
+    // Si la transmisión anterior aún no ha terminado, no encolamos otra.
+    // Esto evita llenar la cola RMT y evita el flush timeout.
+    if (s_led.rmt_busy) {
+        return;
+    }
+
     for (int logical = 0; logical < LED_ACTIVE_COUNT; logical++) {
         uint8_t physical = LOGICAL_TO_PHYSICAL[logical];
 
@@ -226,6 +264,8 @@ static void write_frame_to_strip(const rgb_t frame[LED_ACTIVE_COUNT], bool visib
         .loop_count = 0,
     };
 
+    s_led.rmt_busy = true;
+
     esp_err_t err = rmt_transmit(
         s_led.rmt_chan,
         s_led.rmt_encoder,
@@ -234,11 +274,25 @@ static void write_frame_to_strip(const rgb_t frame[LED_ACTIVE_COUNT], bool visib
         &tx_config
     );
 
-    if (err == ESP_OK) {
-        (void)rmt_tx_wait_all_done(s_led.rmt_chan, pdMS_TO_TICKS(20));
+    if (err != ESP_OK) {
+        s_led.rmt_busy = false;
+
+#if LED_LOG_RMT_ERRORS
+        uint32_t now = now_ms();
+
+        // Evita spamear el puerto serie si algo va mal.
+        if (now - s_led.last_rmt_error_ms > 1000U) {
+            s_led.last_rmt_error_ms = now;
+            ESP_LOGE(TAG, "rmt_transmit failed: %s", esp_err_to_name(err));
+        }
+#endif
+        return;
     }
 
-    // Reset/latch >300 us
+    // No usamos rmt_tx_wait_all_done().
+    // La liberación de rmt_busy se hace en el callback on_trans_done.
+
+    // Reset/latch >300 us. Como la tarea espera 100 ms, sobra.
     vTaskDelay(pdMS_TO_TICKS(1));
 }
 
@@ -462,11 +516,15 @@ esp_err_t led_manager_init(void)
         .gpio_num = LED_GPIO,
         .mem_block_symbols = 64,
         .resolution_hz = LED_RMT_RESOLUTION_HZ,
-        .trans_queue_depth = 4,
+
+        // Importante: no queremos cola larga.
+        // Si algo va mal, una cola de 4 acaba acumulando transmisiones.
+        .trans_queue_depth = 1,
     };
 
     esp_err_t err = rmt_new_tx_channel(&tx_config, &s_led.rmt_chan);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "rmt_new_tx_channel failed: %s", esp_err_to_name(err));
         return err;
     }
 
@@ -488,11 +546,28 @@ esp_err_t led_manager_init(void)
 
     err = rmt_new_bytes_encoder(&encoder_config, &s_led.rmt_encoder);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "rmt_new_bytes_encoder failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    rmt_tx_event_callbacks_t callbacks = {
+        .on_trans_done = rmt_tx_done_callback,
+    };
+
+    err = rmt_tx_register_event_callbacks(
+        s_led.rmt_chan,
+        &callbacks,
+        &s_led
+    );
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "rmt_tx_register_event_callbacks failed: %s", esp_err_to_name(err));
         return err;
     }
 
     err = rmt_enable(s_led.rmt_chan);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "rmt_enable failed: %s", esp_err_to_name(err));
         return err;
     }
 
@@ -507,7 +582,10 @@ esp_err_t led_manager_init(void)
     s_led.event_end_ms = 0;
     s_led.extra_event_ms = 0;
     s_led.event_mask = 0;
+    s_led.rmt_busy = false;
+    s_led.last_rmt_error_ms = 0;
 
+    memset(s_led.cached_frame, 0, sizeof(s_led.cached_frame));
     memset(s_led.tx_buffer, 0, sizeof(s_led.tx_buffer));
 
     BaseType_t ok = xTaskCreate(
@@ -520,6 +598,7 @@ esp_err_t led_manager_init(void)
     );
 
     if (ok != pdPASS) {
+        ESP_LOGE(TAG, "No se pudo crear led_task");
         return ESP_FAIL;
     }
 

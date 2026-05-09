@@ -18,7 +18,8 @@
 #define SDA_GPIO        GPIO_NUM_22
 #define SCL_GPIO        GPIO_NUM_23
 
-#define IMU_ADDR        0x6B
+#define IMU_ADDR_PRIMARY      0x6B
+#define IMU_ADDR_SECONDARY    0x6A
 
 #define REG_WHO_AM_I    0x0F
 #define WHO_AM_I_VALUE  0x6C
@@ -74,6 +75,9 @@ static const char *TAG = "IMU";
 static i2c_master_bus_handle_t bus = NULL;
 static i2c_master_dev_handle_t dev = NULL;
 
+static uint8_t s_imu_addr = 0;
+static bool s_imu_ok = false;
+
 static TaskHandle_t imu_task_handle = NULL;
 
 static imu_event_callback_t pickup_callback = NULL;
@@ -124,36 +128,28 @@ static uint32_t now_ms(void)
 // I2C / LSM6DSO32
 // -----------------------------------------------------------------------------
 
-static void i2c_init_internal(void)
-{
-    i2c_master_bus_config_t cfg = {
-        .i2c_port = I2C_PORT,
-        .sda_io_num = SDA_GPIO,
-        .scl_io_num = SCL_GPIO,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-
-    ESP_ERROR_CHECK(i2c_new_master_bus(&cfg, &bus));
-
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = IMU_ADDR,
-        .scl_speed_hz = 400000,
-    };
-
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &dev_cfg, &dev));
-}
-
 static esp_err_t imu_write(uint8_t reg, uint8_t val)
 {
+    if (dev == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     uint8_t data[2] = { reg, val };
-    return i2c_master_transmit(dev, data, sizeof(data), pdMS_TO_TICKS(100));
+
+    return i2c_master_transmit(
+        dev,
+        data,
+        sizeof(data),
+        pdMS_TO_TICKS(100)
+    );
 }
 
 static esp_err_t imu_read(uint8_t reg, uint8_t *data, int len)
 {
+    if (dev == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     return i2c_master_transmit_receive(
         dev,
         &reg,
@@ -169,35 +165,178 @@ static bool imu_read_u8(uint8_t reg, uint8_t *val)
     return imu_read(reg, val, 1) == ESP_OK;
 }
 
+static esp_err_t imu_add_device(uint8_t addr)
+{
+    if (dev != NULL) {
+        i2c_master_bus_rm_device(dev);
+        dev = NULL;
+    }
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = addr,
+        .scl_speed_hz = 400000,
+    };
+
+    return i2c_master_bus_add_device(bus, &dev_cfg, &dev);
+}
+
+static bool imu_try_address(uint8_t addr)
+{
+    ESP_LOGI(TAG, "Probando IMU en direccion 0x%02X", addr);
+
+    esp_err_t err = imu_add_device(addr);
+    if (err != ESP_OK) {
+        ESP_LOGE(
+            TAG,
+            "No se pudo anadir device 0x%02X: %s",
+            addr,
+            esp_err_to_name(err)
+        );
+        return false;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    uint8_t who = 0;
+    if (!imu_read_u8(REG_WHO_AM_I, &who)) {
+        ESP_LOGW(TAG, "No se pudo leer WHO_AM_I en 0x%02X", addr);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "WHO_AM_I en 0x%02X = 0x%02X", addr, who);
+
+    if (who != WHO_AM_I_VALUE) {
+        ESP_LOGW(
+            TAG,
+            "WHO_AM_I inesperado en 0x%02X. Esperado 0x%02X",
+            addr,
+            WHO_AM_I_VALUE
+        );
+        return false;
+    }
+
+    s_imu_addr = addr;
+    ESP_LOGI(TAG, "IMU encontrada en 0x%02X", s_imu_addr);
+
+    return true;
+}
+
+static esp_err_t i2c_init_internal(void)
+{
+    if (bus != NULL) {
+        ESP_LOGW(TAG, "Bus I2C ya inicializado");
+        return ESP_OK;
+    }
+
+    i2c_master_bus_config_t cfg = {
+        .i2c_port = I2C_PORT,
+        .sda_io_num = SDA_GPIO,
+        .scl_io_num = SCL_GPIO,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+
+    esp_err_t err = i2c_new_master_bus(&cfg, &bus);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error creando bus I2C: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    if (imu_try_address(IMU_ADDR_PRIMARY)) {
+        return ESP_OK;
+    }
+
+    if (imu_try_address(IMU_ADDR_SECONDARY)) {
+        return ESP_OK;
+    }
+
+    ESP_LOGE(
+        TAG,
+        "IMU no encontrada ni en 0x%02X ni en 0x%02X",
+        IMU_ADDR_PRIMARY,
+        IMU_ADDR_SECONDARY
+    );
+
+    return ESP_ERR_NOT_FOUND;
+}
+
 // -----------------------------------------------------------------------------
 // INIT / CALLBACKS
 // -----------------------------------------------------------------------------
 
 void imu_init(void)
 {
-    i2c_init_internal();
+    s_imu_ok = false;
+
+    esp_err_t err = i2c_init_internal();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "No se pudo inicializar la IMU");
+        return;
+    }
 
     vTaskDelay(pdMS_TO_TICKS(50));
 
     uint8_t who = 0;
     if (!imu_read_u8(REG_WHO_AM_I, &who)) {
-        ESP_LOGE(TAG, "No se pudo leer WHO_AM_I");
+        ESP_LOGE(TAG, "No se pudo leer WHO_AM_I despues de inicializar I2C");
         return;
     }
 
-    ESP_LOGI(TAG, "WHO_AM_I = 0x%02X", who);
+    ESP_LOGI(TAG, "WHO_AM_I final = 0x%02X", who);
 
     if (who != WHO_AM_I_VALUE) {
-        ESP_LOGW(TAG, "WHO_AM_I inesperado. Esperado 0x%02X", WHO_AM_I_VALUE);
+        ESP_LOGE(
+            TAG,
+            "IMU incorrecta. Esperado 0x%02X, recibido 0x%02X",
+            WHO_AM_I_VALUE,
+            who
+        );
+        return;
     }
 
-    ESP_ERROR_CHECK(imu_write(REG_CTRL3_C, CTRL3_C_BDU | CTRL3_C_IF_INC));
-    ESP_ERROR_CHECK(imu_write(REG_CTRL1_XL, CTRL1_XL_104HZ_8G));
-    ESP_ERROR_CHECK(imu_write(REG_CTRL2_G, CTRL2_G_104HZ_500DPS));
+    err = imu_write(REG_CTRL3_C, CTRL3_C_BDU | CTRL3_C_IF_INC);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error configurando CTRL3_C: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = imu_write(REG_CTRL1_XL, CTRL1_XL_104HZ_8G);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error configurando CTRL1_XL: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = imu_write(REG_CTRL2_G, CTRL2_G_104HZ_500DPS);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error configurando CTRL2_G: %s", esp_err_to_name(err));
+        return;
+    }
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    ESP_LOGI(TAG, "LSM6DSO32 inicializada");
+    // Reiniciamos estados internos de detección
+    ax = ay = az = 0;
+    gx = gy = gz = 0;
+
+    accel_norm = 0;
+    prev_accel_norm = 0;
+    accel_delta = 0;
+    gyro_activity = 0;
+
+    first_sample = true;
+
+    last_pickup_ms = 0;
+    pickup_counter = 0;
+
+    shake_window_start_ms = 0;
+    last_shake_peak_ms = 0;
+    shake_peak_count = 0;
+
+    s_imu_ok = true;
+
+    ESP_LOGI(TAG, "LSM6DSO32 inicializada en 0x%02X", s_imu_addr);
 }
 
 void imu_set_pickup_callback(imu_event_callback_t cb)
@@ -216,16 +355,22 @@ void imu_set_shake_callback(imu_event_callback_t cb)
 
 static bool imu_read_sample(void)
 {
-    uint8_t raw_g[6];
-    uint8_t raw_a[6];
-
-    if (imu_read(REG_OUTX_L_G, raw_g, 6) != ESP_OK) {
-        ESP_LOGW(TAG, "Error leyendo gyro");
+    if (!s_imu_ok || dev == NULL) {
         return false;
     }
 
-    if (imu_read(REG_OUTX_L_A, raw_a, 6) != ESP_OK) {
-        ESP_LOGW(TAG, "Error leyendo accel");
+    uint8_t raw_g[6];
+    uint8_t raw_a[6];
+
+    esp_err_t err = imu_read(REG_OUTX_L_G, raw_g, 6);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Error leyendo gyro: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    err = imu_read(REG_OUTX_L_A, raw_a, 6);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Error leyendo accel: %s", esp_err_to_name(err));
         return false;
     }
 
@@ -293,10 +438,13 @@ static void detect_pickup(uint32_t now, bool strong_shake_sample)
 static void detect_shake(uint32_t now, bool strong_shake_sample)
 {
     if (!strong_shake_sample) {
-        if (now - shake_window_start_ms > SHAKE_WINDOW_MS) {
+        if (shake_window_start_ms != 0 &&
+            now - shake_window_start_ms > SHAKE_WINDOW_MS) {
             shake_peak_count = 0;
             shake_window_start_ms = 0;
+            last_shake_peak_ms = 0;
         }
+
         return;
     }
 
@@ -366,6 +514,11 @@ static void imu_task(void *arg)
 void imu_start_task(void)
 {
     if (imu_task_handle != NULL) {
+        return;
+    }
+
+    if (!s_imu_ok) {
+        ESP_LOGE(TAG, "No se arranca la task IMU porque la IMU no esta inicializada");
         return;
     }
 
