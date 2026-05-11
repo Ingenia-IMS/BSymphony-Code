@@ -92,7 +92,7 @@ static void light_tormenta(void)
 
 static void light_viento(void)
 {
-    led_manager_set_diagonal_dual(LED_COLOR_CYAN, LED_COLOR_LIGHT_BLUE);
+    led_manager_set_diagonal_dual(LED_COLOR_WHITE, LED_COLOR_LIGHT_BLUE);
 }
 
 // -----------------------------------------------------------------------------

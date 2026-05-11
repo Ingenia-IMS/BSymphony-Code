@@ -25,7 +25,7 @@
 
 /* ---------------- FASE 2B: búsqueda / bloqueo / presencia ---------------- */
 
-#define IR_SEARCH_TIMEOUT_MS            8000
+#define IR_SEARCH_TIMEOUT_MS            3000
 #define IR_SEARCH_STEP_MS               18
 #define IR_SEARCH_TX_PROB_PERCENT       45
 
