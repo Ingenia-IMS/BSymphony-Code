@@ -6,7 +6,6 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_random.h"
-#include "esp_rom_sys.h"
 #include "esp_timer.h"
 
 #include "freertos/FreeRTOS.h"
@@ -14,7 +13,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-static const char *TAG = "IR";
+static const char *TAG = "IR_LINK";
 
 #define IR_FACE_COUNT 4
 
@@ -36,14 +35,13 @@ typedef struct {
     uint8_t order[IR_FACE_COUNT];
     uint8_t order_index;
     uint8_t confirm_hits;
+    uint8_t sync_hits;
 
     uint64_t state_since_us;
     uint64_t search_started_us;
     uint64_t sync_time_us;
     uint64_t last_rx_us;
-    uint64_t last_sync_tx_us;
-    uint64_t last_presence_tx_us;
-    uint64_t claim_deadline_us;
+    uint64_t next_presence_tx_us;
 } ir_ctx_t;
 
 static QueueHandle_t s_cmd_q = NULL;
@@ -59,20 +57,23 @@ static void hw_select_face(ir_face_t face);
 static void hw_tx_on(void);
 static void hw_tx_off(void);
 static bool hw_rx_active(void);
+
 static uint64_t now_us(void);
-static void delay_us(uint32_t us);
+static uint32_t now_ms(void);
+static uint32_t rand_percent(void);
+static uint32_t rand_range_ms(uint32_t max_ms);
 
 static void enter_state(ir_ctx_t *ctx, ir_link_state_t state);
 static void publish_event(const ir_ctx_t *ctx, ir_event_type_t type);
 static void shuffle_order(ir_ctx_t *ctx);
-static uint32_t random_percent(void);
+static void schedule_next_presence(ir_ctx_t *ctx);
 
-static void signal_send_beacon(uint8_t bursts);
-static bool signal_detect_activity(uint32_t window_us);
+static void signal_send_presence(void);
+static bool signal_receive_window(uint32_t window_ms);
 
 static void handle_search(ir_ctx_t *ctx);
 static void handle_confirm(ir_ctx_t *ctx);
-static void handle_syncing(ir_ctx_t *ctx);
+static void handle_sync(ir_ctx_t *ctx);
 static void handle_ready(ir_ctx_t *ctx);
 
 void ir_link_init(void)
@@ -107,12 +108,14 @@ void ir_link_init(void)
 
 void ir_link_start_search(void)
 {
-    if (s_cmd_q == NULL) return;
+    if (s_cmd_q == NULL) {
+        return;
+    }
 
     ir_status_t st;
     if (ir_link_get_status(&st)) {
         if (st.state != IR_LINK_IDLE) {
-            ESP_LOGI(TAG, "Ignoro start_search porque estado actual=%s", ir_link_state_name(st.state));
+            ESP_LOGI(TAG, "start_search ignorado: estado=%s", ir_link_state_name(st.state));
             return;
         }
     }
@@ -123,20 +126,28 @@ void ir_link_start_search(void)
 
 void ir_link_stop(void)
 {
-    if (s_cmd_q == NULL) return;
+    if (s_cmd_q == NULL) {
+        return;
+    }
+
     ir_cmd_t cmd = {.type = IR_CMD_STOP};
     xQueueSend(s_cmd_q, &cmd, 0);
 }
 
 bool ir_link_get_event(ir_event_t *out, uint32_t timeout_ms)
 {
-    if (out == NULL || s_event_q == NULL) return false;
+    if (out == NULL || s_event_q == NULL) {
+        return false;
+    }
+
     return xQueueReceive(s_event_q, out, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
 }
 
 bool ir_link_get_status(ir_status_t *out)
 {
-    if (out == NULL || s_mutex == NULL) return false;
+    if (out == NULL || s_mutex == NULL) {
+        return false;
+    }
 
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(10)) != pdTRUE) {
         return false;
@@ -162,14 +173,18 @@ bool ir_link_is_ready(void)
 ir_face_t ir_link_get_locked_face(void)
 {
     ir_status_t st;
-    if (!ir_link_get_status(&st)) return IR_FACE_NONE;
+    if (!ir_link_get_status(&st)) {
+        return IR_FACE_NONE;
+    }
     return st.locked_face;
 }
 
 ir_role_t ir_link_get_role(void)
 {
     ir_status_t st;
-    if (!ir_link_get_status(&st)) return IR_ROLE_UNKNOWN;
+    if (!ir_link_get_status(&st)) {
+        return IR_ROLE_UNKNOWN;
+    }
     return st.role;
 }
 
@@ -209,6 +224,17 @@ const char *ir_link_event_name(ir_event_type_t event)
     }
 }
 
+const char *ir_link_face_name(ir_face_t face)
+{
+    switch (face) {
+        case IR_FACE_0: return "arriba";
+        case IR_FACE_1: return "abajo";
+        case IR_FACE_2: return "izquierda";
+        case IR_FACE_3: return "derecha";
+        default: return "none";
+    }
+}
+
 static void ir_task(void *arg)
 {
     (void)arg;
@@ -218,23 +244,28 @@ static void ir_task(void *arg)
         while (xQueueReceive(s_cmd_q, &cmd, 0) == pdTRUE) {
             if (cmd.type == IR_CMD_START_SEARCH) {
                 hw_tx_off();
+
                 s_ctx.locked_face = IR_FACE_NONE;
                 s_ctx.candidate_face = IR_FACE_NONE;
                 s_ctx.role = IR_ROLE_UNKNOWN;
                 s_ctx.confirm_hits = 0;
+                s_ctx.sync_hits = 0;
                 s_ctx.last_rx_us = 0;
                 s_ctx.sync_time_us = 0;
-                s_ctx.last_sync_tx_us = 0;
-                s_ctx.last_presence_tx_us = 0;
                 s_ctx.search_started_us = now_us();
+                s_ctx.next_presence_tx_us = 0;
+
                 shuffle_order(&s_ctx);
                 enter_state(&s_ctx, IR_LINK_SEARCHING);
                 publish_event(&s_ctx, IR_EVENT_SEARCH_STARTED);
+
             } else if (cmd.type == IR_CMD_STOP) {
                 hw_tx_off();
+
                 s_ctx.locked_face = IR_FACE_NONE;
                 s_ctx.candidate_face = IR_FACE_NONE;
                 s_ctx.role = IR_ROLE_UNKNOWN;
+
                 enter_state(&s_ctx, IR_LINK_IDLE);
                 publish_event(&s_ctx, IR_EVENT_STOPPED);
             }
@@ -250,7 +281,7 @@ static void ir_task(void *arg)
                 break;
 
             case IR_LINK_SYNCING:
-                handle_syncing(&s_ctx);
+                handle_sync(&s_ctx);
                 break;
 
             case IR_LINK_READY:
@@ -260,7 +291,8 @@ static void ir_task(void *arg)
             case IR_LINK_IDLE:
             case IR_LINK_LOCKED:
             default:
-                vTaskDelay(pdMS_TO_TICKS(25));
+                hw_tx_off();
+                vTaskDelay(pdMS_TO_TICKS(30));
                 break;
         }
     }
@@ -296,8 +328,9 @@ static void hw_init(void)
     hw_tx_off();
     hw_select_face(IR_FACE_0);
 
-    ESP_LOGI(TAG, "init SEL0=%d SEL1=%d RX=%d TX=%d active=%d",
-             IR_SEL0_GPIO, IR_SEL1_GPIO, IR_RX_GPIO, IR_TX_GPIO, IR_RX_ACTIVE_LEVEL);
+    ESP_LOGI(TAG,
+             "init face map: 0=arriba 1=abajo 2=izquierda 3=derecha | SEL0=%d SEL1=%d RX=%d TX=%d",
+             IR_SEL0_GPIO, IR_SEL1_GPIO, IR_RX_GPIO, IR_TX_GPIO);
 }
 
 static void hw_select_face(ir_face_t face)
@@ -307,12 +340,10 @@ static void hw_select_face(ir_face_t face)
         return;
     }
 
-    uint8_t f = (uint8_t)face;
+    uint8_t f = (uint8_t)face & 0x03;
 
     gpio_set_level(IR_SEL0_GPIO, f & 0x01);
     gpio_set_level(IR_SEL1_GPIO, (f >> 1) & 0x01);
-
-    delay_us(20);
 }
 
 static void hw_tx_on(void)
@@ -335,55 +366,59 @@ static uint64_t now_us(void)
     return (uint64_t)esp_timer_get_time();
 }
 
-static void delay_us(uint32_t us)
+static uint32_t now_ms(void)
 {
-    esp_rom_delay_us(us);
+    return (uint32_t)(esp_timer_get_time() / 1000ULL);
 }
 
-// -----------------------------------------------------------------------------
-// Señal IR mínima
-// -----------------------------------------------------------------------------
-
-static void signal_send_beacon(uint8_t bursts)
+static uint32_t rand_percent(void)
 {
-    for (uint8_t i = 0; i < bursts; i++) {
-        hw_tx_on();
-        delay_us(IR_BEACON_BURST_US);
-        hw_tx_off();
-        delay_us(IR_BEACON_GAP_US);
+    return esp_random() % 100U;
+}
+
+static uint32_t rand_range_ms(uint32_t max_ms)
+{
+    if (max_ms == 0) {
+        return 0;
     }
+    return esp_random() % max_ms;
 }
 
-static bool signal_detect_activity(uint32_t window_us)
+// -----------------------------------------------------------------------------
+// Señal IR lenta y cooperativa
+// -----------------------------------------------------------------------------
+
+static void signal_send_presence(void)
 {
-    /*
-     * Ventana de recepción pura: NO se emite nada aquí.
-     * Esto es clave para evitar auto-detección.
-     */
+    hw_tx_on();
+    vTaskDelay(pdMS_TO_TICKS(IR_TX_ON_MS));
+    hw_tx_off();
+    vTaskDelay(pdMS_TO_TICKS(IR_TX_OFF_MS));
+}
+
+static bool signal_receive_window(uint32_t window_ms)
+{
     hw_tx_off();
 
-    uint64_t end = now_us() + window_us;
-    uint64_t active_since = 0;
+    uint32_t start = now_ms();
+    uint8_t active_count = 0;
 
-    while (now_us() < end) {
+    while ((now_ms() - start) < window_ms) {
         if (hw_rx_active()) {
-            if (active_since == 0) {
-                active_since = now_us();
-            } else if ((now_us() - active_since) >= IR_RX_MIN_ACTIVE_US) {
+            active_count++;
+            if (active_count >= IR_RX_REQUIRED_ACTIVE_SAMPLES) {
                 return true;
             }
-        } else {
-            active_since = 0;
         }
 
-        delay_us(IR_RX_POLL_US);
+        vTaskDelay(pdMS_TO_TICKS(IR_RX_SAMPLE_PERIOD_MS));
     }
 
     return false;
 }
 
 // -----------------------------------------------------------------------------
-// Máquina de estados
+// Estado y eventos
 // -----------------------------------------------------------------------------
 
 static void enter_state(ir_ctx_t *ctx, ir_link_state_t state)
@@ -400,7 +435,9 @@ static void enter_state(ir_ctx_t *ctx, ir_link_state_t state)
 
 static void publish_event(const ir_ctx_t *ctx, ir_event_type_t type)
 {
-    if (s_event_q == NULL) return;
+    if (s_event_q == NULL) {
+        return;
+    }
 
     ir_event_t ev = {
         .type = type,
@@ -411,11 +448,6 @@ static void publish_event(const ir_ctx_t *ctx, ir_event_type_t type)
     };
 
     xQueueSend(s_event_q, &ev, 0);
-}
-
-static uint32_t random_percent(void)
-{
-    return esp_random() % 100U;
 }
 
 static void shuffle_order(ir_ctx_t *ctx)
@@ -435,11 +467,19 @@ static void shuffle_order(ir_ctx_t *ctx)
     ctx->order_index = 0;
 }
 
+static void schedule_next_presence(ir_ctx_t *ctx)
+{
+    uint32_t delay_ms = IR_READY_TX_PERIOD_MIN_MS + rand_range_ms(IR_READY_TX_PERIOD_JITTER_MS);
+    ctx->next_presence_tx_us = now_us() + ((uint64_t)delay_ms * 1000ULL);
+}
+
+// -----------------------------------------------------------------------------
+// Máquina de estados
+// -----------------------------------------------------------------------------
+
 static void handle_search(ir_ctx_t *ctx)
 {
-    uint64_t t = now_us();
-
-    if (t - ctx->search_started_us > IR_SEARCH_TIMEOUT_US) {
+    if ((now_ms() - (uint32_t)(ctx->search_started_us / 1000ULL)) > IR_SEARCH_TIMEOUT_MS) {
         hw_tx_off();
         ctx->locked_face = IR_FACE_NONE;
         ctx->candidate_face = IR_FACE_NONE;
@@ -455,57 +495,43 @@ static void handle_search(ir_ctx_t *ctx)
     ir_face_t face = (ir_face_t)ctx->order[ctx->order_index++];
     hw_select_face(face);
 
-    bool tx_slot = random_percent() < IR_SEARCH_TX_PROB_PERCENT;
-
-    if (tx_slot) {
-        /*
-         * Emito, pero NO cuento RX en este slot.
-         * Así no me bloqueo por mi propia emisión.
-         */
-        signal_send_beacon(IR_BEACON_BURSTS);
+    if (rand_percent() < IR_SEARCH_TX_PROB_PERCENT) {
+        signal_send_presence();
     } else {
-        /*
-         * Escucha pura.
-         */
-        if (signal_detect_activity(IR_SEARCH_RX_WINDOW_US)) {
+        if (signal_receive_window(IR_RX_WINDOW_MS)) {
             ctx->candidate_face = face;
             ctx->confirm_hits = 1;
             ctx->last_rx_us = now_us();
+
             enter_state(ctx, IR_LINK_CONFIRMING_FACE);
             publish_event(ctx, IR_EVENT_CANDIDATE_FACE);
-            vTaskDelay(pdMS_TO_TICKS(IR_CONFIRM_TICK_MS));
+            vTaskDelay(pdMS_TO_TICKS(IR_CONFIRM_STEP_MS));
             return;
         }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(IR_SEARCH_TICK_MS));
+    vTaskDelay(pdMS_TO_TICKS(IR_SEARCH_STEP_MS));
 }
 
 static void handle_confirm(ir_ctx_t *ctx)
 {
-    uint64_t t = now_us();
+    uint32_t elapsed_ms = (uint32_t)((now_us() - ctx->state_since_us) / 1000ULL);
 
-    if (ctx->candidate_face == IR_FACE_NONE) {
-        enter_state(ctx, IR_LINK_SEARCHING);
-        return;
-    }
-
-    if (t - ctx->state_since_us > IR_CONFIRM_TIMEOUT_US) {
+    if (elapsed_ms > IR_CONFIRM_TIMEOUT_MS) {
         ctx->candidate_face = IR_FACE_NONE;
         ctx->confirm_hits = 0;
         shuffle_order(ctx);
         enter_state(ctx, IR_LINK_SEARCHING);
+        vTaskDelay(pdMS_TO_TICKS(IR_SEARCH_STEP_MS));
         return;
     }
 
     hw_select_face(ctx->candidate_face);
 
-    bool tx_slot = random_percent() < IR_CONFIRM_TX_PROB_PERCENT;
-
-    if (tx_slot) {
-        signal_send_beacon(IR_BEACON_BURSTS);
+    if (rand_percent() < IR_CONFIRM_TX_PROB_PERCENT) {
+        signal_send_presence();
     } else {
-        if (signal_detect_activity(IR_CONFIRM_RX_WINDOW_US)) {
+        if (signal_receive_window(IR_RX_WINDOW_MS)) {
             ctx->confirm_hits++;
             ctx->last_rx_us = now_us();
         }
@@ -514,26 +540,24 @@ static void handle_confirm(ir_ctx_t *ctx)
     if (ctx->confirm_hits >= IR_CONFIRM_REQUIRED_HITS) {
         ctx->locked_face = ctx->candidate_face;
         ctx->candidate_face = IR_FACE_NONE;
-        ctx->role = IR_ROLE_UNKNOWN;
-        hw_select_face(ctx->locked_face);
 
         enter_state(ctx, IR_LINK_LOCKED);
         publish_event(ctx, IR_EVENT_FACE_LOCKED);
 
-        ctx->claim_deadline_us = now_us() + IR_SYNC_CLAIM_MIN_US + (esp_random() % IR_SYNC_CLAIM_RANDOM_US);
+        ctx->sync_hits = 0;
         enter_state(ctx, IR_LINK_SYNCING);
-        vTaskDelay(pdMS_TO_TICKS(IR_SYNC_TICK_MS));
+        vTaskDelay(pdMS_TO_TICKS(IR_SYNC_STEP_MS));
         return;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(IR_CONFIRM_TICK_MS));
+    vTaskDelay(pdMS_TO_TICKS(IR_CONFIRM_STEP_MS));
 }
 
-static void handle_syncing(ir_ctx_t *ctx)
+static void handle_sync(ir_ctx_t *ctx)
 {
-    uint64_t t = now_us();
+    uint32_t elapsed_ms = (uint32_t)((now_us() - ctx->state_since_us) / 1000ULL);
 
-    if (t - ctx->state_since_us > IR_SYNC_TIMEOUT_US) {
+    if (elapsed_ms > IR_SYNC_TIMEOUT_MS) {
         ctx->locked_face = IR_FACE_NONE;
         ctx->candidate_face = IR_FACE_NONE;
         ctx->role = IR_ROLE_UNKNOWN;
@@ -544,74 +568,56 @@ static void handle_syncing(ir_ctx_t *ctx)
 
     hw_select_face(ctx->locked_face);
 
-    if (t < ctx->claim_deadline_us) {
-        if (signal_detect_activity(IR_SYNC_RX_WINDOW_US)) {
-            ctx->role = IR_ROLE_FOLLOWER;
+    if (rand_percent() < IR_SYNC_TX_PROB_PERCENT) {
+        signal_send_presence();
+    } else {
+        if (signal_receive_window(IR_RX_WINDOW_MS)) {
+            ctx->sync_hits++;
             ctx->last_rx_us = now_us();
-            ctx->sync_time_us = now_us();
-            enter_state(ctx, IR_LINK_READY);
-            publish_event(ctx, IR_EVENT_SYNCED);
-            vTaskDelay(pdMS_TO_TICKS(IR_READY_TICK_MS));
-            return;
         }
+    }
 
-        if (random_percent() < IR_SYNC_TX_PROB_PERCENT) {
-            signal_send_beacon(IR_BEACON_BURSTS);
-        }
+    if (ctx->sync_hits >= IR_SYNC_REQUIRED_HITS) {
+        ctx->role = (rand_percent() < 50) ? IR_ROLE_LEADER : IR_ROLE_FOLLOWER;
+        ctx->sync_time_us = now_us();
+        ctx->last_rx_us = now_us();
+        schedule_next_presence(ctx);
 
-        vTaskDelay(pdMS_TO_TICKS(IR_SYNC_TICK_MS));
+        enter_state(ctx, IR_LINK_READY);
+        publish_event(ctx, IR_EVENT_SYNCED);
+        vTaskDelay(pdMS_TO_TICKS(IR_READY_STEP_MS));
         return;
     }
 
-    ctx->role = IR_ROLE_LEADER;
-    ctx->sync_time_us = now_us();
-    signal_send_beacon(5);
-    ctx->last_sync_tx_us = now_us();
-    ctx->last_presence_tx_us = now_us();
-    ctx->last_rx_us = now_us();
-
-    enter_state(ctx, IR_LINK_READY);
-    publish_event(ctx, IR_EVENT_SYNCED);
-    vTaskDelay(pdMS_TO_TICKS(IR_READY_TICK_MS));
+    vTaskDelay(pdMS_TO_TICKS(IR_SYNC_STEP_MS));
 }
 
 static void handle_ready(ir_ctx_t *ctx)
 {
-    uint64_t t = now_us();
-
     hw_select_face(ctx->locked_face);
 
-    if (signal_detect_activity(IR_READY_RX_WINDOW_US)) {
-        ctx->last_rx_us = now_us();
+    uint64_t t = now_us();
 
-        if (ctx->role == IR_ROLE_FOLLOWER) {
-            ctx->sync_time_us = now_us();
-        }
-    }
-
-    if (ctx->last_rx_us != 0 && (t - ctx->last_rx_us > IR_LOST_TIMEOUT_US)) {
+    if (ctx->last_rx_us != 0 && (t - ctx->last_rx_us) > ((uint64_t)IR_LOST_TIMEOUT_MS * 1000ULL)) {
         hw_tx_off();
         ctx->locked_face = IR_FACE_NONE;
         ctx->candidate_face = IR_FACE_NONE;
         ctx->role = IR_ROLE_UNKNOWN;
         enter_state(ctx, IR_LINK_IDLE);
         publish_event(ctx, IR_EVENT_LINK_LOST);
-        vTaskDelay(pdMS_TO_TICKS(IR_READY_TICK_MS));
+        vTaskDelay(pdMS_TO_TICKS(IR_READY_STEP_MS));
         return;
     }
 
-    if (ctx->role == IR_ROLE_LEADER) {
-        if (t - ctx->last_sync_tx_us >= IR_SYNC_PERIOD_US) {
+    if (ctx->next_presence_tx_us == 0 || t >= ctx->next_presence_tx_us) {
+        signal_send_presence();
+        schedule_next_presence(ctx);
+    } else {
+        if (signal_receive_window(IR_READY_RX_WINDOW_MS)) {
+            ctx->last_rx_us = now_us();
             ctx->sync_time_us = now_us();
-            signal_send_beacon(5);
-            ctx->last_sync_tx_us = now_us();
-        }
-    } else if (ctx->role == IR_ROLE_FOLLOWER) {
-        if (t - ctx->last_presence_tx_us >= IR_PRESENCE_PERIOD_US) {
-            signal_send_beacon(2);
-            ctx->last_presence_tx_us = now_us();
         }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(IR_READY_TICK_MS));
+    vTaskDelay(pdMS_TO_TICKS(IR_READY_STEP_MS));
 }

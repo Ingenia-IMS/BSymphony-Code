@@ -9,10 +9,10 @@ extern "C" {
 
 typedef enum {
     IR_FACE_NONE = -1,
-    IR_FACE_0 = 0,
-    IR_FACE_1 = 1,
-    IR_FACE_2 = 2,
-    IR_FACE_3 = 3,
+    IR_FACE_0 = 0,   // arriba
+    IR_FACE_1 = 1,   // abajo
+    IR_FACE_2 = 2,   // izquierda
+    IR_FACE_3 = 3,   // derecha
 } ir_face_t;
 
 typedef enum {
@@ -71,6 +71,7 @@ ir_role_t ir_link_get_role(void);
 const char *ir_link_state_name(ir_link_state_t state);
 const char *ir_link_role_name(ir_role_t role);
 const char *ir_link_event_name(ir_event_type_t event);
+const char *ir_link_face_name(ir_face_t face);
 
 #ifdef __cplusplus
 }
