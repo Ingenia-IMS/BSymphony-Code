@@ -10,14 +10,32 @@ typedef struct {
 const element_t *element_catalog_get_by_name(const char *name);
 
 /*
- * Devuelve el resultado de combinar dos elementos.
+ * Consulta simétrica clásica:
+ * fuego + agua == agua + fuego
  *
- * - Las combinaciones son simétricas:
- *      fuego + agua == agua + fuego
+ * Devuelve el resultado si existe combinación.
+ * Devuelve NULL si no hay combinación.
  *
- * - Si no hay combinación definida, devuelve NULL.
- *
- * - Esta función NO cambia el estado del cubo.
- *   Solo consulta la tabla de recetas.
+ * Esta función NO decide qué cubo cambia.
  */
 const char *element_catalog_combine_names(const char *a, const char *b);
+
+/*
+ * Consulta orientada al cubo local:
+ *
+ * Devuelve el nuevo elemento SOLO SI el elemento local es el que debe cambiar
+ * para esa receta.
+ *
+ * Ejemplo:
+ *   receta: fuego + agua -> naturaleza, cambia fuego
+ *
+ *   element_catalog_get_local_change_result("fuego", "agua")
+ *       devuelve "naturaleza"
+ *
+ *   element_catalog_get_local_change_result("agua", "fuego")
+ *       devuelve NULL
+ *
+ * Así evitamos depender de leader/follower para transformar.
+ */
+const char *element_catalog_get_local_change_result(const char *local,
+                                                    const char *remote);

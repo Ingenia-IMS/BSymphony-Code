@@ -124,50 +124,65 @@ static const size_t element_count =
     sizeof(element_list) / sizeof(element_list[0]);
 
 // -----------------------------------------------------------------------------
-// RECETAS DE COMBINACIÓN
+// RECETAS DE COMBINACIÓN CON ELEMENTO QUE CAMBIA
 // -----------------------------------------------------------------------------
 //
 // Regla actual:
-// - Si dos cubos se conectan y hay receta, solo cambia el leader.
-// - Si no hay receta, no ocurre nada.
+// - Si dos cubos se conectan y hay receta, cambia solo el elemento indicado
+//   por change_element.
+// - Si el cubo local no es change_element, no cambia.
+// - Si no hay receta, no pasa nada.
 // - Ninguna receta debería devolver uno de los dos elementos de entrada.
 // -----------------------------------------------------------------------------
 
 typedef struct {
     const char *a;
     const char *b;
+    const char *change_element;
     const char *result;
 } element_recipe_t;
 
 static const element_recipe_t recipe_list[] = {
-    // Recetas base inspiradas en el Processing original, adaptadas al catálogo actual.
-    { "fuego",        "agua",          "naturaleza"   },
-    { "agua",         "viento",        "tormenta"     },
-    { "tormenta",     "viento",        "electricidad" },
-    { "electricidad", "naturaleza",    "mono"         },
-    { "electricidad", "viento",        "pajaro"       },
-    { "piedra",       "fuego",         "metal"        },
-    { "fuego",        "metal",         "pistola"      },
-    { "mono",         "fuego",         "humano"       },
-    { "naturaleza",   "fuego",         "piedra"       },
-    { "humano",       "naturaleza",    "reggaeton"    },
-    { "humano",       "metal",         "robot"        },
-    { "humano",       "pistola",       "oeste"        },
+    /*
+     * Recetas base adaptadas.
+     *
+     * El tercer campo indica qué elemento cambia.
+     * Ejemplo:
+     *   fuego + agua -> naturaleza, cambia fuego
+     */
 
-    // Receta corregida.
-    { "piedra",       "electricidad",  "rock"         },
+    { "fuego",        "agua",          "fuego",        "naturaleza"   },
+    { "agua",         "viento",        "agua",         "tormenta"     },
+    { "tormenta",     "viento",        "tormenta",     "electricidad" },
+    { "electricidad", "naturaleza",    "naturaleza",   "mono"         },
+    { "electricidad", "viento",        "electricidad", "pajaro"       },
+    { "piedra",       "fuego",         "piedra",       "metal"        },
+    { "fuego",        "metal",         "metal",        "pistola"      },
+    { "mono",         "fuego",         "mono",         "humano"       },
+    { "naturaleza",   "fuego",         "naturaleza",   "piedra"       },
+    { "humano",       "naturaleza",    "naturaleza",   "reggaeton"    },
+    { "humano",       "metal",         "humano",       "robot"        },
+    { "humano",       "pistola",       "pistola",      "oeste"        },
 
-    // Recetas añadidas para que los elementos terminales den más juego.
-    { "robot",        "reggaeton",     "electricidad" },
-    { "robot",        "pajaro",        "viento"       },
-    { "oeste",        "fuego",         "pistola"      },
-    { "oeste",        "humano",        "metal"        },
-    { "pajaro",       "tormenta",      "electricidad" },
-    { "reggaeton",    "viento",        "rock"         },
-    { "rock",         "electricidad",  "robot"        },
-    { "rock",         "fuego",         "metal"        },
-    { "robot",        "piedra",        "metal"        },
-    { "oeste",        "reggaeton",     "rock"         },
+    /*
+     * Receta corregida por diseño actual.
+     */
+    { "piedra",       "electricidad",  "piedra",       "rock"         },
+
+    /*
+     * Recetas añadidas para que los elementos terminales den más juego.
+     * Las puedes revisar o cambiar fácilmente en el futuro.
+     */
+    { "robot",        "reggaeton",     "robot",        "electricidad" },
+    { "robot",        "pajaro",        "robot",        "viento"       },
+    { "oeste",        "fuego",         "oeste",        "pistola"      },
+    { "oeste",        "humano",        "oeste",        "metal"        },
+    { "pajaro",       "tormenta",      "pajaro",       "electricidad" },
+    { "reggaeton",    "viento",        "reggaeton",    "rock"         },
+    { "rock",         "electricidad",  "rock",         "robot"        },
+    { "rock",         "fuego",         "rock",         "metal"        },
+    { "robot",        "piedra",        "robot",        "metal"        },
+    { "oeste",        "reggaeton",     "oeste",        "rock"         },
 };
 
 static const size_t recipe_count =
@@ -190,9 +205,9 @@ const element_t *element_catalog_get_by_name(const char *name)
     return NULL;
 }
 
-static bool recipe_matches(const element_recipe_t *recipe,
-                           const char *a,
-                           const char *b)
+static bool recipe_matches_pair(const element_recipe_t *recipe,
+                                const char *a,
+                                const char *b)
 {
     if (recipe == NULL || a == NULL || b == NULL) {
         return false;
@@ -209,9 +224,36 @@ const char *element_catalog_combine_names(const char *a, const char *b)
     }
 
     for (size_t i = 0; i < recipe_count; i++) {
-        if (recipe_matches(&recipe_list[i], a, b)) {
+        if (recipe_matches_pair(&recipe_list[i], a, b)) {
             return recipe_list[i].result;
         }
+    }
+
+    return NULL;
+}
+
+const char *element_catalog_get_local_change_result(const char *local,
+                                                    const char *remote)
+{
+    if (local == NULL || remote == NULL) {
+        return NULL;
+    }
+
+    for (size_t i = 0; i < recipe_count; i++) {
+        const element_recipe_t *recipe = &recipe_list[i];
+
+        if (!recipe_matches_pair(recipe, local, remote)) {
+            continue;
+        }
+
+        /*
+         * Solo cambia el cubo cuyo elemento local coincida con change_element.
+         */
+        if (strcmp(recipe->change_element, local) == 0) {
+            return recipe->result;
+        }
+
+        return NULL;
     }
 
     return NULL;

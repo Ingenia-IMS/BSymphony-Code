@@ -19,7 +19,7 @@
 #define LED_BRIGHTNESS_20_PERCENT 51
 #define MAIN_TASK_DELAY_MS        10
 
-static const char *TAG = "MAIN_IR_PHASE4";
+static const char *TAG = "MAIN_IR_PHASE4C";
 
 static volatile bool s_shake_requested = false;
 static volatile bool s_pickup_requested = false;
@@ -30,14 +30,11 @@ static uint64_t s_visual_sync_time_us = 0;
 static bool s_visual_last_on = false;
 
 /*
- * Evita que en una misma conexión se hagan varias transformaciones en cadena.
+ * Evita varias transformaciones en una misma conexión IR.
  *
- * Ejemplo que queremos evitar:
- *   agua + fuego -> naturaleza
- *   naturaleza + fuego -> piedra
- *   piedra + fuego -> metal
- *
- * En cada enlace IR solo se procesa la primera combinación recibida.
+ * Aunque ya no dependemos de leader/follower, esto sigue siendo importante:
+ * si fuego cambia a naturaleza, no queremos que en la misma conexión vuelva
+ * a combinar naturaleza + agua o naturaleza + fuego.
  */
 static bool s_combination_done_for_link = false;
 
@@ -155,6 +152,10 @@ static void debug_update_synced_led(void)
         return;
     }
 
+    /*
+     * El rol ya no decide quién transforma.
+     * Lo seguimos usando solo para depuración visual.
+     */
     if (s_visual_role == IR_ROLE_LEADER) {
         led_manager_set_solid(LED_COLOR_GREEN);
     } else if (s_visual_role == IR_ROLE_FOLLOWER) {
@@ -176,37 +177,25 @@ static void handle_remote_element_rx(const ir_event_t *ev)
              local_name,
              ir_link_role_name(ev->role));
 
-    /*
-     * De momento solo cambia el leader.
-     * El follower recibe el elemento remoto, pero no transforma.
-     */
-    if (ev->role != IR_ROLE_LEADER) {
-        ESP_LOGI(TAG, "No transformo: este cubo no es leader");
-        return;
-    }
-
-    /*
-     * Solo una transformación por conexión.
-     */
     if (s_combination_done_for_link) {
         ESP_LOGI(TAG, "No transformo: esta conexión ya fue procesada");
         return;
     }
 
-    s_combination_done_for_link = true;
-
-    const char *result = element_catalog_combine_names(local_name, remote_name);
+    const char *result = element_catalog_get_local_change_result(local_name, remote_name);
 
     if (result == NULL) {
         ESP_LOGI(TAG,
-                 "Sin combinación definida: %s + %s -> nada",
+                 "Este cubo no cambia o no hay receta: local=%s remote=%s",
                  local_name,
                  remote_name);
         return;
     }
 
+    s_combination_done_for_link = true;
+
     ESP_LOGI(TAG,
-             "COMBINACION LEADER: %s + %s -> %s",
+             "COMBINACION LOCAL: %s + %s -> %s | cambia este cubo",
              local_name,
              remote_name,
              result);
@@ -220,6 +209,12 @@ static void handle_remote_element_rx(const ir_event_t *ev)
 
     if (cube_state_set_element_by_name(result)) {
         cube_state_play_current_sound();
+
+        /*
+         * Muy importante:
+         * a partir de ahora, si seguimos anunciando elemento por IR,
+         * anunciamos el nuevo.
+         */
         ir_link_set_local_element_name(cube_state_get_current_name());
     } else {
         ESP_LOGW(TAG, "La combinación dio un elemento inexistente: %s", result);
@@ -251,10 +246,6 @@ static void handle_ir_event(const ir_event_t *ev)
             break;
 
         case IR_EVENT_SYNCED:
-            /*
-             * Al sincronizar empieza una conexión nueva.
-             * Permitimos una combinación en esta conexión.
-             */
             s_combination_done_for_link = false;
             debug_led_synced_start(ev->role, ev->sync_time_us);
             break;
@@ -291,7 +282,7 @@ static void handle_ir_event(const ir_event_t *ev)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Prueba IR fase 4: leader transforma con tabla de combinaciones");
+    ESP_LOGI(TAG, "Prueba IR fase 4C: cambia el elemento indicado por la receta");
 
     ESP_ERROR_CHECK(led_manager_init());
     ESP_ERROR_CHECK(led_manager_set_master_brightness(LED_BRIGHTNESS_20_PERCENT));
@@ -301,7 +292,15 @@ void app_main(void)
     sound_player_init();
 
     cube_state_init();
-    cube_state_set_element_by_name("fuego");
+    // cube_state_set_element_by_name("fuego");
+
+    /*
+     * Para pruebas manuales puedes forzar un elemento inicial en un cubo:
+     *
+     *   cube_state_set_element_by_name("fuego");
+     *
+     * Y dejar el otro en "agua".
+     */
 
     imu_init();
     imu_set_pickup_callback(on_imu_pickup);
@@ -315,7 +314,7 @@ void app_main(void)
 
     while (1) {
         /*
-         * Mantener actualizado el elemento que se anuncia por IR.
+         * Mantener actualizado el elemento anunciado por IR.
          */
         ir_link_set_local_element_name(cube_state_get_current_name());
 
