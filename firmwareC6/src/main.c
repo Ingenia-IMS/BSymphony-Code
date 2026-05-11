@@ -6,6 +6,7 @@
 #include "freertos/task.h"
 
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 
 #include "leds/led_manager.h"
@@ -18,10 +19,33 @@
 #define LED_BRIGHTNESS_20_PERCENT 51
 #define MAIN_TASK_DELAY_MS        10
 
-#define SYNC_LED_PERIOD_US        450000ULL
-#define SYNC_LED_ON_US            150000ULL
+/*
+ * Búsqueda: parpadeo lento manteniendo el color/efecto del elemento actual.
+ * Emparejado: usamos el blink nativo del led_manager, que es más rápido.
+ */
+#define SEARCH_BLINK_HALF_MS      350
+
+/*
+ * Reset externo sin abrir el cubo:
+ *
+ * Tres agitados vigorosos rápidos reinician el elemento del cubo a uno
+ * aleatorio entre agua, fuego y viento.
+ *
+ * No depende de que fallen búsquedas IR.
+ * Funciona aunque el cubo esté buscando, emparejado o en cualquier elemento.
+ */
+#define RESET_SHAKE_REQUIRED_COUNT     3
+#define RESET_SHAKE_MAX_GAP_MS         1200
 
 static const char *TAG = "MAIN";
+
+// -----------------------------------------------------------------------------
+// Elementos iniciales
+// -----------------------------------------------------------------------------
+//
+// En el juego hablamos de "aire", pero el elemento implementado se llama
+// "viento" en el catálogo.
+//
 
 static const char *INITIAL_ELEMENTS[] = {
     "agua",
@@ -34,15 +58,65 @@ static const char *INITIAL_ELEMENTS[] = {
 
 static size_t s_initial_element_index = 0;
 
+// -----------------------------------------------------------------------------
+// Flags desde callbacks IMU
+// -----------------------------------------------------------------------------
+
 static volatile bool s_shake_requested = false;
 static volatile bool s_pickup_requested = false;
 
-static bool s_ir_ready_visual = false;
-static ir_role_t s_visual_role = IR_ROLE_UNKNOWN;
-static uint64_t s_visual_sync_time_us = 0;
-static bool s_visual_last_on = false;
+// -----------------------------------------------------------------------------
+// Estado de combinación / conexión
+// -----------------------------------------------------------------------------
 
-static bool s_combination_done_for_link = false;
+/*
+ * Evita varias transformaciones dentro de la misma conexión IR.
+ *
+ * También sirve para que, una vez recibido el elemento remoto y decidido
+ * si hay cambio o no, se apague el parpadeo de emparejado y se mantenga
+ * el elemento actual hasta que se separen los cubos.
+ */
+static bool s_exchange_done_for_link = false;
+
+// -----------------------------------------------------------------------------
+// Estado de secuencia de reset por triple agitado
+// -----------------------------------------------------------------------------
+
+static uint8_t s_reset_shake_count = 0;
+static uint32_t s_last_reset_shake_ms = 0;
+
+// -----------------------------------------------------------------------------
+// Estado visual
+// -----------------------------------------------------------------------------
+
+typedef enum {
+    VISUAL_IDLE = 0,
+    VISUAL_SEARCH_BLINK,
+    VISUAL_PAIRED_FAST_BLINK,
+} visual_mode_t;
+
+static visual_mode_t s_visual_mode = VISUAL_IDLE;
+static bool s_search_visible = true;
+static uint32_t s_last_search_blink_ms = 0;
+
+// -----------------------------------------------------------------------------
+// Estado de inicialización
+// -----------------------------------------------------------------------------
+
+static bool s_ir_initialized = false;
+
+// -----------------------------------------------------------------------------
+// Tiempo
+// -----------------------------------------------------------------------------
+
+static uint32_t now_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000ULL);
+}
+
+// -----------------------------------------------------------------------------
+// Callbacks IMU
+// -----------------------------------------------------------------------------
 
 static void on_imu_shake(void)
 {
@@ -54,9 +128,39 @@ static void on_imu_pickup(void)
     s_pickup_requested = true;
 }
 
+// -----------------------------------------------------------------------------
+// Helpers IR / elemento
+// -----------------------------------------------------------------------------
+
 static void update_ir_advertised_element(void)
 {
+    if (!s_ir_initialized) {
+        return;
+    }
+
     ir_link_set_local_element_name(cube_state_get_current_name());
+}
+
+static bool ir_is_active(void)
+{
+    ir_status_t st;
+
+    if (!ir_link_get_status(&st)) {
+        return false;
+    }
+
+    return st.state != IR_LINK_IDLE;
+}
+
+static void apply_current_element_light(void)
+{
+    const char *name = cube_state_get_current_name();
+
+    if (name != NULL) {
+        cube_state_set_element_by_name(name);
+    } else {
+        led_manager_set_off();
+    }
 }
 
 static void set_initial_element_by_index(size_t index, bool play_sound)
@@ -78,9 +182,10 @@ static void set_initial_element_by_index(size_t index, bool play_sound)
     }
 }
 
-static void select_next_initial_element(void)
+static void choose_random_initial_element(bool play_sound)
 {
-    set_initial_element_by_index(s_initial_element_index + 1, true);
+    size_t index = esp_random() % INITIAL_ELEMENT_COUNT;
+    set_initial_element_by_index(index, play_sound);
 }
 
 static void sync_initial_index_with_current_element(void)
@@ -99,124 +204,160 @@ static void sync_initial_index_with_current_element(void)
     }
 }
 
-static bool ir_is_active(void)
-{
-    ir_status_t st;
+// -----------------------------------------------------------------------------
+// Visuales
+// -----------------------------------------------------------------------------
 
-    if (!ir_link_get_status(&st)) {
+static void visual_idle_current_element(void)
+{
+    s_visual_mode = VISUAL_IDLE;
+    s_search_visible = true;
+
+    led_manager_set_blink_enabled(false);
+    apply_current_element_light();
+}
+
+static void visual_start_search_blink(void)
+{
+    s_visual_mode = VISUAL_SEARCH_BLINK;
+    s_search_visible = true;
+    s_last_search_blink_ms = now_ms();
+
+    led_manager_set_blink_enabled(false);
+    apply_current_element_light();
+}
+
+static void visual_start_paired_fast_blink(void)
+{
+    s_visual_mode = VISUAL_PAIRED_FAST_BLINK;
+    s_search_visible = true;
+
+    /*
+     * Mismo elemento, pero parpadeo rápido.
+     * El led_manager ya implementa ese blink internamente.
+     */
+    apply_current_element_light();
+    led_manager_set_blink_enabled(true);
+}
+
+static void visual_stop_pairing_blink_keep_element(void)
+{
+    s_visual_mode = VISUAL_IDLE;
+    s_search_visible = true;
+
+    led_manager_set_blink_enabled(false);
+    apply_current_element_light();
+}
+
+static void visual_flash_green_then_current(void)
+{
+    s_visual_mode = VISUAL_IDLE;
+    s_search_visible = true;
+
+    led_manager_set_blink_enabled(false);
+    led_manager_set_solid(LED_COLOR_GREEN);
+    vTaskDelay(pdMS_TO_TICKS(80));
+
+    apply_current_element_light();
+}
+
+static void visual_flash_reset_then_current(void)
+{
+    s_visual_mode = VISUAL_IDLE;
+    s_search_visible = true;
+
+    led_manager_set_blink_enabled(false);
+
+    /*
+     * Triple flash verde para distinguirlo del flash corto de desconexión.
+     */
+    for (uint8_t i = 0; i < 3; i++) {
+        led_manager_set_solid(LED_COLOR_GREEN);
+        vTaskDelay(pdMS_TO_TICKS(70));
+        led_manager_set_off();
+        vTaskDelay(pdMS_TO_TICKS(70));
+    }
+
+    apply_current_element_light();
+}
+
+static void visual_update(void)
+{
+    if (s_visual_mode != VISUAL_SEARCH_BLINK) {
+        return;
+    }
+
+    uint32_t t = now_ms();
+
+    if ((t - s_last_search_blink_ms) < SEARCH_BLINK_HALF_MS) {
+        return;
+    }
+
+    s_last_search_blink_ms = t;
+    s_search_visible = !s_search_visible;
+
+    if (s_search_visible) {
+        apply_current_element_light();
+    } else {
+        led_manager_set_off();
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Reset externo por triple agitado
+// -----------------------------------------------------------------------------
+
+static void reset_triple_shake_sequence(void)
+{
+    s_reset_shake_count = 0;
+    s_last_reset_shake_ms = 0;
+}
+
+static bool register_shake_for_external_reset(void)
+{
+    uint32_t t = now_ms();
+
+    if (s_last_reset_shake_ms == 0 ||
+        (t - s_last_reset_shake_ms) > RESET_SHAKE_MAX_GAP_MS) {
+        s_reset_shake_count = 0;
+    }
+
+    s_last_reset_shake_ms = t;
+    s_reset_shake_count++;
+
+    ESP_LOGI(TAG,
+             "Secuencia reset por agitado: %u/%u",
+             s_reset_shake_count,
+             RESET_SHAKE_REQUIRED_COUNT);
+
+    if (s_reset_shake_count < RESET_SHAKE_REQUIRED_COUNT) {
         return false;
     }
 
-    return st.state != IR_LINK_IDLE;
+    reset_triple_shake_sequence();
+    return true;
 }
 
-static void reset_link_combination_state(void)
+static void perform_external_random_reset(void)
 {
-    s_combination_done_for_link = false;
+    ESP_LOGI(TAG, "Reset externo por triple agitado: nuevo elemento inicial aleatorio");
+
+    /*
+     * Si estaba buscando o enlazado por IR, cortamos esa sesión.
+     * Así el reset deja el cubo limpio y disponible.
+     */
+    ir_link_stop();
+
+    s_exchange_done_for_link = false;
+
+    choose_random_initial_element(true);
+    visual_flash_reset_then_current();
+    update_ir_advertised_element();
 }
 
-static void led_show_searching(void)
-{
-    s_ir_ready_visual = false;
-    led_manager_set_blink_enabled(true);
-    led_manager_set_solid(LED_COLOR_YELLOW);
-}
-
-static void led_show_candidate(void)
-{
-    s_ir_ready_visual = false;
-    led_manager_set_blink_enabled(true);
-    led_manager_set_solid(LED_COLOR_ORANGE);
-}
-
-static void led_show_locked_face(ir_face_t face)
-{
-    s_ir_ready_visual = false;
-    led_manager_set_blink_enabled(false);
-
-    switch (face) {
-        case IR_FACE_0:
-            led_manager_set_solid(LED_COLOR_BLUE);
-            break;
-        case IR_FACE_1:
-            led_manager_set_solid(LED_COLOR_LIGHT_BLUE);
-            break;
-        case IR_FACE_2:
-            led_manager_set_solid(LED_COLOR_PURPLE);
-            break;
-        case IR_FACE_3:
-            led_manager_set_solid(LED_COLOR_PINK);
-            break;
-        default:
-            led_manager_set_solid(LED_COLOR_WHITE);
-            break;
-    }
-}
-
-static void led_start_synced_visual(ir_role_t role, uint64_t sync_time_us)
-{
-    led_manager_set_blink_enabled(false);
-
-    s_ir_ready_visual = true;
-    s_visual_role = role;
-    s_visual_sync_time_us = sync_time_us;
-    s_visual_last_on = false;
-}
-
-static void led_stop_synced_visual(void)
-{
-    s_ir_ready_visual = false;
-    led_manager_set_blink_enabled(false);
-}
-
-static void led_show_current_element(void)
-{
-    led_stop_synced_visual();
-
-    const char *name = cube_state_get_current_name();
-
-    if (name != NULL) {
-        cube_state_set_element_by_name(name);
-    } else {
-        led_manager_set_off();
-    }
-}
-
-static void led_show_error(void)
-{
-    led_stop_synced_visual();
-    led_manager_set_solid(LED_COLOR_RED);
-}
-
-static void led_update_synced_visual(void)
-{
-    if (!s_ir_ready_visual) {
-        return;
-    }
-
-    uint64_t now_us = (uint64_t)esp_timer_get_time();
-    uint64_t phase_us = (now_us - s_visual_sync_time_us) % SYNC_LED_PERIOD_US;
-    bool on = phase_us < SYNC_LED_ON_US;
-
-    if (on == s_visual_last_on) {
-        return;
-    }
-
-    s_visual_last_on = on;
-
-    if (!on) {
-        led_manager_set_off();
-        return;
-    }
-
-    if (s_visual_role == IR_ROLE_LEADER) {
-        led_manager_set_solid(LED_COLOR_GREEN);
-    } else if (s_visual_role == IR_ROLE_FOLLOWER) {
-        led_manager_set_solid(LED_COLOR_CYAN);
-    } else {
-        led_manager_set_solid(LED_COLOR_WHITE);
-    }
-}
+// -----------------------------------------------------------------------------
+// Transformación
+// -----------------------------------------------------------------------------
 
 static void apply_remote_element_if_needed(const ir_event_t *ev)
 {
@@ -230,10 +371,16 @@ static void apply_remote_element_if_needed(const ir_event_t *ev)
              local_name,
              ir_link_role_name(ev->role));
 
-    if (s_combination_done_for_link) {
-        ESP_LOGI(TAG, "No transformo: esta conexión ya fue procesada");
+    /*
+     * Ya se recibió un elemento remoto en esta conexión.
+     * No reintentamos ni encadenamos cambios.
+     */
+    if (s_exchange_done_for_link) {
+        ESP_LOGI(TAG, "Intercambio ya procesado en esta conexión");
         return;
     }
+
+    s_exchange_done_for_link = true;
 
     const char *result = element_catalog_get_local_change_result(local_name, remote_name);
 
@@ -242,10 +389,14 @@ static void apply_remote_element_if_needed(const ir_event_t *ev)
                  "Sin cambio local: local=%s remote=%s",
                  local_name,
                  remote_name);
+
+        /*
+         * Ya terminó el intercambio: no hubo transformación,
+         * pero visualmente salimos del modo emparejado.
+         */
+        visual_stop_pairing_blink_keep_element();
         return;
     }
-
-    s_combination_done_for_link = true;
 
     ESP_LOGI(TAG,
              "COMBINACION LOCAL: %s + %s -> %s",
@@ -253,39 +404,53 @@ static void apply_remote_element_if_needed(const ir_event_t *ev)
              remote_name,
              result);
 
-    led_stop_synced_visual();
+    led_manager_set_blink_enabled(false);
 
     if (!cube_state_set_element_by_name(result)) {
         ESP_LOGW(TAG, "Resultado de combinación inexistente: %s", result);
+        visual_stop_pairing_blink_keep_element();
         return;
     }
 
     cube_state_play_current_sound();
     update_ir_advertised_element();
     sync_initial_index_with_current_element();
+
+    /*
+     * Ya terminó el intercambio y se ha transformado:
+     * queda fijo mostrando el nuevo elemento.
+     */
+    visual_stop_pairing_blink_keep_element();
 }
+
+// -----------------------------------------------------------------------------
+// Eventos IR
+// -----------------------------------------------------------------------------
 
 static void handle_ir_search_timeout(void)
 {
-    ESP_LOGI(TAG, "IR timeout: no se encontró otro cubo. Cambio elemento inicial.");
+    ESP_LOGI(TAG, "IR timeout: no se encontró otro cubo");
 
-    reset_link_combination_state();
+    s_exchange_done_for_link = false;
 
-    led_show_error();
-    vTaskDelay(pdMS_TO_TICKS(200));
-
-    select_next_initial_element();
+    /*
+     * Ya NO cambia agua/fuego/viento por cada búsqueda fallida.
+     * El cambio aleatorio de elemento inicial se hace solo con triple agitado.
+     */
+    visual_idle_current_element();
 }
 
 static void handle_ir_link_lost(void)
 {
     ESP_LOGI(TAG, "IR perdido: 3 s sin ver al otro cubo");
 
-    reset_link_combination_state();
+    s_exchange_done_for_link = false;
 
-    led_show_error();
-    vTaskDelay(pdMS_TO_TICKS(300));
-    led_show_current_element();
+    /*
+     * Flash verde muy breve para indicar desconexión.
+     * Luego vuelve a mostrar el elemento actual y queda disponible.
+     */
+    visual_flash_green_then_current();
 }
 
 static void handle_ir_event(const ir_event_t *ev)
@@ -300,24 +465,36 @@ static void handle_ir_event(const ir_event_t *ev)
 
     switch (ev->type) {
         case IR_EVENT_SEARCH_STARTED:
-            reset_link_combination_state();
-            led_show_searching();
+            s_exchange_done_for_link = false;
+            visual_start_search_blink();
             break;
 
         case IR_EVENT_CANDIDATE_FACE:
-            led_show_candidate();
+            /*
+             * Desde fuera no cambiamos de color.
+             * Sigue parpadeando el elemento actual.
+             */
             break;
 
         case IR_EVENT_FACE_LOCKED:
-            led_show_locked_face(ev->face);
+            /*
+             * Ya encontró cara, pero seguimos mostrando el mismo elemento.
+             */
             break;
 
         case IR_EVENT_SYNCED:
-            reset_link_combination_state();
-            led_start_synced_visual(ev->role, ev->sync_time_us);
+            /*
+             * Emparejado: mismo elemento, parpadeo más rápido.
+             */
+            s_exchange_done_for_link = false;
+            visual_start_paired_fast_blink();
             break;
 
         case IR_EVENT_REMOTE_ELEMENT_RX:
+            /*
+             * Acabó el intercambio, con o sin transformación.
+             * Esta función se encarga de quitar el parpadeo.
+             */
             apply_remote_element_if_needed(ev);
             break;
 
@@ -330,8 +507,8 @@ static void handle_ir_event(const ir_event_t *ev)
             break;
 
         case IR_EVENT_STOPPED:
-            reset_link_combination_state();
-            led_show_current_element();
+            s_exchange_done_for_link = false;
+            visual_idle_current_element();
             break;
 
         default:
@@ -347,6 +524,10 @@ static void process_ir_events(void)
         handle_ir_event(&ev);
     }
 }
+
+// -----------------------------------------------------------------------------
+// Acciones por IMU
+// -----------------------------------------------------------------------------
 
 static void process_pickup_request(void)
 {
@@ -376,23 +557,35 @@ static void process_shake_request(void)
 
     s_shake_requested = false;
 
-    ir_status_t st;
-
-    if (!ir_link_get_status(&st) || st.state != IR_LINK_IDLE) {
-        ESP_LOGI(TAG, "Agitado ignorado: IR no está idle");
+    /*
+     * Primero registramos el agitado para la secuencia de reset.
+     * Esto ocurre siempre: da igual que el cubo esté idle, buscando, enlazado
+     * o en cualquier elemento.
+     */
+    if (register_shake_for_external_reset()) {
+        perform_external_random_reset();
         return;
     }
 
     /*
-     * Siempre se intenta comunicar primero.
-     * Si no encuentra otro cubo, IR_EVENT_SEARCH_TIMEOUT hará el cambio:
-     * agua -> fuego -> viento -> agua.
+     * Además, un agitado vigoroso intenta comunicar si el IR está disponible.
      */
+    ir_status_t st;
+
+    if (!ir_link_get_status(&st) || st.state != IR_LINK_IDLE) {
+        ESP_LOGI(TAG, "Agitado registrado para reset, pero IR no está idle");
+        return;
+    }
+
     ESP_LOGI(TAG, "Agitado vigoroso -> empieza búsqueda IR");
 
     ir_link_start_search();
-    led_show_searching();
+    visual_start_search_blink();
 }
+
+// -----------------------------------------------------------------------------
+// Inicialización
+// -----------------------------------------------------------------------------
 
 static void init_leds(void)
 {
@@ -413,8 +606,13 @@ static void init_imu(void)
 static void init_ir(void)
 {
     ir_link_init();
+    s_ir_initialized = true;
     update_ir_advertised_element();
 }
+
+// -----------------------------------------------------------------------------
+// Main
+// -----------------------------------------------------------------------------
 
 void app_main(void)
 {
@@ -425,19 +623,15 @@ void app_main(void)
     cube_state_init();
 
     /*
-     * El cubo empieza siempre en uno de los tres elementos básicos.
-     *
-     * Índices:
-     *   0 = agua
-     *   1 = fuego
-     *   2 = viento
+     * Al resetear/encender el cubo, escoge aleatoriamente uno de:
+     * agua, fuego o viento.
      */
-    set_initial_element_by_index(0, false);
+    choose_random_initial_element(false);
 
     init_imu();
     init_ir();
 
-    ESP_LOGI(TAG, "Listo. Sacude para comunicar o, si no hay cubo, cambiar agua/fuego/viento.");
+    ESP_LOGI(TAG, "Listo. Sacude para comunicar. Triple agitado rápido = reset aleatorio.");
 
     while (1) {
         update_ir_advertised_element();
@@ -445,7 +639,7 @@ void app_main(void)
         process_pickup_request();
         process_shake_request();
         process_ir_events();
-        led_update_synced_visual();
+        visual_update();
 
         vTaskDelay(pdMS_TO_TICKS(MAIN_TASK_DELAY_MS));
     }
