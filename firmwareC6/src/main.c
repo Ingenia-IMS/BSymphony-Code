@@ -13,12 +13,13 @@
 #include "imu/imu_manager.h"
 #include "sonido/sound_player.h"
 #include "elementos/cube_state.h"
+#include "elementos/element_catalog.h"
 #include "IR/ir_link.h"
 
 #define LED_BRIGHTNESS_20_PERCENT 51
 #define MAIN_TASK_DELAY_MS        10
 
-static const char *TAG = "MAIN_IR_PHASE3";
+static const char *TAG = "MAIN_IR_PHASE4";
 
 static volatile bool s_shake_requested = false;
 static volatile bool s_pickup_requested = false;
@@ -27,6 +28,18 @@ static bool s_ir_ready_visual = false;
 static ir_role_t s_visual_role = IR_ROLE_UNKNOWN;
 static uint64_t s_visual_sync_time_us = 0;
 static bool s_visual_last_on = false;
+
+/*
+ * Evita que en una misma conexión se hagan varias transformaciones en cadena.
+ *
+ * Ejemplo que queremos evitar:
+ *   agua + fuego -> naturaleza
+ *   naturaleza + fuego -> piedra
+ *   piedra + fuego -> metal
+ *
+ * En cada enlace IR solo se procesa la primera combinación recibida.
+ */
+static bool s_combination_done_for_link = false;
 
 static void on_imu_shake(void)
 {
@@ -72,15 +85,19 @@ static void debug_led_locked(ir_face_t face)
         case IR_FACE_0:
             led_manager_set_solid(LED_COLOR_BLUE);
             break;
+
         case IR_FACE_1:
             led_manager_set_solid(LED_COLOR_LIGHT_BLUE);
             break;
+
         case IR_FACE_2:
             led_manager_set_solid(LED_COLOR_PURPLE);
             break;
+
         case IR_FACE_3:
             led_manager_set_solid(LED_COLOR_PINK);
             break;
+
         default:
             led_manager_set_solid(LED_COLOR_WHITE);
             break;
@@ -147,6 +164,68 @@ static void debug_update_synced_led(void)
     }
 }
 
+static void handle_remote_element_rx(const ir_event_t *ev)
+{
+    const char *local_name = cube_state_get_current_name();
+    const char *remote_name = ev->remote_element_name;
+
+    ESP_LOGI(TAG,
+             "Elemento remoto recibido por IR: id=%u name=%s | local=%s | role=%s",
+             ev->remote_element_id,
+             remote_name,
+             local_name,
+             ir_link_role_name(ev->role));
+
+    /*
+     * De momento solo cambia el leader.
+     * El follower recibe el elemento remoto, pero no transforma.
+     */
+    if (ev->role != IR_ROLE_LEADER) {
+        ESP_LOGI(TAG, "No transformo: este cubo no es leader");
+        return;
+    }
+
+    /*
+     * Solo una transformación por conexión.
+     */
+    if (s_combination_done_for_link) {
+        ESP_LOGI(TAG, "No transformo: esta conexión ya fue procesada");
+        return;
+    }
+
+    s_combination_done_for_link = true;
+
+    const char *result = element_catalog_combine_names(local_name, remote_name);
+
+    if (result == NULL) {
+        ESP_LOGI(TAG,
+                 "Sin combinación definida: %s + %s -> nada",
+                 local_name,
+                 remote_name);
+        return;
+    }
+
+    ESP_LOGI(TAG,
+             "COMBINACION LEADER: %s + %s -> %s",
+             local_name,
+             remote_name,
+             result);
+
+    /*
+     * Al transformar, dejamos de pintar el parpadeo verde/cian de READY
+     * para que se vea la luz propia del nuevo elemento.
+     */
+    s_ir_ready_visual = false;
+    led_manager_set_blink_enabled(false);
+
+    if (cube_state_set_element_by_name(result)) {
+        cube_state_play_current_sound();
+        ir_link_set_local_element_name(cube_state_get_current_name());
+    } else {
+        ESP_LOGW(TAG, "La combinación dio un elemento inexistente: %s", result);
+    }
+}
+
 static void handle_ir_event(const ir_event_t *ev)
 {
     ESP_LOGI(TAG,
@@ -159,6 +238,7 @@ static void handle_ir_event(const ir_event_t *ev)
 
     switch (ev->type) {
         case IR_EVENT_SEARCH_STARTED:
+            s_combination_done_for_link = false;
             debug_led_searching();
             break;
 
@@ -171,24 +251,21 @@ static void handle_ir_event(const ir_event_t *ev)
             break;
 
         case IR_EVENT_SYNCED:
+            /*
+             * Al sincronizar empieza una conexión nueva.
+             * Permitimos una combinación en esta conexión.
+             */
+            s_combination_done_for_link = false;
             debug_led_synced_start(ev->role, ev->sync_time_us);
             break;
 
         case IR_EVENT_REMOTE_ELEMENT_RX:
-            ESP_LOGI(TAG,
-                     "Elemento remoto recibido por IR: id=%u name=%s",
-                     ev->remote_element_id,
-                     ev->remote_element_name);
-            /*
-             * Para depuración visual: un flash blanco muy breve.
-             * No cambiamos el elemento local todavía.
-             */
-            led_manager_set_solid(LED_COLOR_WHITE);
-            vTaskDelay(pdMS_TO_TICKS(80));
+            handle_remote_element_rx(ev);
             break;
 
         case IR_EVENT_SEARCH_TIMEOUT:
             ESP_LOGI(TAG, "IR timeout: no se encontró otro cubo");
+            s_combination_done_for_link = false;
             debug_led_error_red();
             vTaskDelay(pdMS_TO_TICKS(300));
             debug_led_idle_from_current_element();
@@ -196,12 +273,14 @@ static void handle_ir_event(const ir_event_t *ev)
 
         case IR_EVENT_LINK_LOST:
             ESP_LOGI(TAG, "IR perdido: 3 s sin ver al otro cubo");
+            s_combination_done_for_link = false;
             debug_led_error_red();
             vTaskDelay(pdMS_TO_TICKS(300));
             debug_led_idle_from_current_element();
             break;
 
         case IR_EVENT_STOPPED:
+            s_combination_done_for_link = false;
             debug_led_idle_from_current_element();
             break;
 
@@ -212,7 +291,7 @@ static void handle_ir_event(const ir_event_t *ev)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Prueba IR fase 3: envío de elemento remoto");
+    ESP_LOGI(TAG, "Prueba IR fase 4: leader transforma con tabla de combinaciones");
 
     ESP_ERROR_CHECK(led_manager_init());
     ESP_ERROR_CHECK(led_manager_set_master_brightness(LED_BRIGHTNESS_20_PERCENT));
@@ -222,6 +301,7 @@ void app_main(void)
     sound_player_init();
 
     cube_state_init();
+    cube_state_set_element_by_name("fuego");
 
     imu_init();
     imu_set_pickup_callback(on_imu_pickup);
@@ -235,8 +315,7 @@ void app_main(void)
 
     while (1) {
         /*
-         * Mantener actualizado el nombre del elemento que se anuncia por IR.
-         * Ahora mismo normalmente será "agua", salvo que tú cambies el estado en otro sitio.
+         * Mantener actualizado el elemento que se anuncia por IR.
          */
         ir_link_set_local_element_name(cube_state_get_current_name());
 
@@ -244,7 +323,9 @@ void app_main(void)
             s_pickup_requested = false;
 
             if (!ir_is_active()) {
-                ESP_LOGI(TAG, "Mover suave -> sonido del elemento actual: %s", cube_state_get_current_name());
+                ESP_LOGI(TAG,
+                         "Mover suave -> sonido del elemento actual: %s",
+                         cube_state_get_current_name());
                 cube_state_play_current_sound();
             } else {
                 ESP_LOGI(TAG, "Mover suave ignorado: IR activo");
