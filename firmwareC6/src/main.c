@@ -1,6 +1,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stddef.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -15,8 +16,9 @@
 #include "IR/ir_link.h"
 
 #define LED_BRIGHTNESS_20_PERCENT 51
+#define MAIN_TASK_DELAY_MS        10
 
-static const char *TAG = "MAIN_IR_PHASE2B";
+static const char *TAG = "MAIN_IR_PHASE3";
 
 static volatile bool s_shake_requested = false;
 static volatile bool s_pickup_requested = false;
@@ -172,6 +174,19 @@ static void handle_ir_event(const ir_event_t *ev)
             debug_led_synced_start(ev->role, ev->sync_time_us);
             break;
 
+        case IR_EVENT_REMOTE_ELEMENT_RX:
+            ESP_LOGI(TAG,
+                     "Elemento remoto recibido por IR: id=%u name=%s",
+                     ev->remote_element_id,
+                     ev->remote_element_name);
+            /*
+             * Para depuración visual: un flash blanco muy breve.
+             * No cambiamos el elemento local todavía.
+             */
+            led_manager_set_solid(LED_COLOR_WHITE);
+            vTaskDelay(pdMS_TO_TICKS(80));
+            break;
+
         case IR_EVENT_SEARCH_TIMEOUT:
             ESP_LOGI(TAG, "IR timeout: no se encontró otro cubo");
             debug_led_error_red();
@@ -197,7 +212,7 @@ static void handle_ir_event(const ir_event_t *ev)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Prueba IR fase 2B: refinamiento de enlace");
+    ESP_LOGI(TAG, "Prueba IR fase 3: envío de elemento remoto");
 
     ESP_ERROR_CHECK(led_manager_init());
     ESP_ERROR_CHECK(led_manager_set_master_brightness(LED_BRIGHTNESS_20_PERCENT));
@@ -214,10 +229,17 @@ void app_main(void)
     imu_start_task();
 
     ir_link_init();
+    ir_link_set_local_element_name(cube_state_get_current_name());
 
     ESP_LOGI(TAG, "Listo. Sacude dos cubos y júntalos por una cara.");
 
     while (1) {
+        /*
+         * Mantener actualizado el nombre del elemento que se anuncia por IR.
+         * Ahora mismo normalmente será "agua", salvo que tú cambies el estado en otro sitio.
+         */
+        ir_link_set_local_element_name(cube_state_get_current_name());
+
         if (s_pickup_requested) {
             s_pickup_requested = false;
 
@@ -249,6 +271,6 @@ void app_main(void)
 
         debug_update_synced_led();
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(MAIN_TASK_DELAY_MS));
     }
 }
