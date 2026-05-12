@@ -163,12 +163,7 @@ static const element_recipe_t recipe_list[] = {
     { "humano",       "naturaleza",    "naturaleza",   "reggaeton"    },
     { "humano",       "metal",         "humano",       "robot"        },
     { "humano",       "pistola",       "pistola",      "oeste"        },
-
-    /*
-     * Receta corregida por diseño actual.
-     */
     { "piedra",       "electricidad",  "piedra",       "rock"         },
-
     /*
      * Recetas añadidas para que los elementos terminales den más juego.
      * Las puedes revisar o cambiar fácilmente en el futuro.
